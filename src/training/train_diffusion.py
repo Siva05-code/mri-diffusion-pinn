@@ -43,16 +43,11 @@ def prepare_batch(sample, mask_func, device, acceleration):
 
     target = torch.abs(target)
 
-    zero_filled = align_and_normalize_slice(
-        zero_filled
     zero_filled, target = align_and_normalize_slice(
         zero_filled,
         target,
     )
 
-    target = align_and_normalize_slice(
-        target
-    )
     if zero_filled.ndim == 2:
         zero_filled = zero_filled.unsqueeze(0).unsqueeze(0)
     elif zero_filled.ndim == 3:
@@ -64,8 +59,6 @@ def prepare_batch(sample, mask_func, device, acceleration):
         target = target.unsqueeze(1)
 
     return (
-        zero_filled.unsqueeze(0),
-        target.unsqueeze(0),
         zero_filled,
         target,
     )
