@@ -1,4 +1,3 @@
-"""Loss functions for training."""
 """Loss functions (image loss, k-space consistency, total loss)."""
 
 from src.losses.image_loss import L1ImageLoss, MSEImageLoss, build_image_loss

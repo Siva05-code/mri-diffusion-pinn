@@ -25,7 +25,6 @@ def plot_zero_filled_comparison(
 
     Supports both 1D Cartesian masks (broadcast to 2D image shape) and already-2D masks.
     """
-    # Convert inputs to numpy arrays if needed
     if hasattr(gt, "cpu"):
         gt = gt.cpu().numpy()
     gt = np.squeeze(np.asarray(gt))
@@ -34,7 +33,6 @@ def plot_zero_filled_comparison(
         mask = mask.cpu().numpy()
     mask = np.squeeze(np.asarray(mask))
 
-    # Convert 1D Cartesian phase-encoding mask to 2D matching image dimensions
     if mask.ndim == 1:
         mask = np.broadcast_to(mask[None, :], gt.shape)
     elif mask.ndim > 2:
@@ -54,7 +52,6 @@ def plot_zero_filled_comparison(
         undersampled_kspace = undersampled_kspace.cpu().numpy()
     undersampled_kspace = np.squeeze(np.asarray(undersampled_kspace))
 
-    # Compute k-space magnitude in log scale
     if np.iscomplexobj(undersampled_kspace):
         kspace_mag = np.abs(undersampled_kspace)
     elif undersampled_kspace.ndim == 3 and undersampled_kspace.shape[-1] == 2:
@@ -71,7 +68,6 @@ def plot_zero_filled_comparison(
     axes[0].axis("off")
     plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
 
-    # 2. Undersampling Mask (guaranteed 2D)
     # 2. Undersampling Mask
     im1 = axes[1].imshow(mask, cmap="gray", aspect="auto")
     axes[1].set_title(f"{accel_factor}x Undersampling Mask", fontsize=11)

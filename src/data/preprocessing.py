@@ -2,7 +2,6 @@
 MRI Data Preprocessing Utilities.
 
 Provides functions to compute magnitude images, normalize k-space and reconstructed images,
-and format complex numbers for PyTorch processing.
 center crop images, and format complex numbers for PyTorch processing.
 """
 
@@ -24,7 +23,6 @@ def complex_abs(data: torch.Tensor) -> torch.Tensor:
         return torch.abs(data)
 
 
-def normalize_zero_one(data: np.ndarray or torch.Tensor, eps: float = 1e-12):
 def normalize_zero_one(data: Union[np.ndarray, torch.Tensor], eps: float = 1e-12):
     """Normalize array/tensor to [0, 1] range."""
     d_min = data.min()
