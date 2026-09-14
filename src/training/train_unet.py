@@ -1,15 +1,17 @@
 """
 Training Engine for U-Net Baseline on Accelerated MRI.
 
-Supports reproducible seeding, Adam optimizer, mixed-precision training (AMP),
-checkpoint persistence, logging, and arbitrary 2D slice dimensions.
+Supports reproducible seeding, Adam optimizer, modern mixed-precision training (torch.amp),
+sanity checks against accidental validation-training contamination, checkpoint persistence,
+and consistent spatial preprocessing.
 """
 
 import os
 import json
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
+from contextlib import nullcontext
 import numpy as np
 import torch
 import torch.nn as nn
@@ -34,14 +36,40 @@ def set_seed(seed: int = 42):
         torch.backends.cudnn.benchmark = False
 
 
+def create_grad_scaler(device: torch.device):
+    """Instantiate GradScaler using modern torch.amp API."""
+    if device.type == "cuda":
+        try:
+            return torch.amp.GradScaler("cuda")
+        except (AttributeError, TypeError):
+            return torch.cuda.amp.GradScaler()
+    return None
+
+
+def get_autocast(device: torch.device):
+    """Context manager for autocast using modern torch.amp API."""
+    if device.type == "cuda":
+        try:
+            return torch.amp.autocast("cuda")
+        except (AttributeError, TypeError):
+            return torch.cuda.amp.autocast()
+    return nullcontext()
+
+
 class SliceTransform:
     """
     Transforms raw k-space sample into (zero-filled input, reference target) pair.
     Handles dimension verification and consistent [0, 1] normalization.
     """
-    def __init__(self, mask_func: RandomMaskFunc, seed: int = 42):
+    def __init__(
+        self,
+        mask_func: RandomMaskFunc,
+        seed: int = 42,
+        crop_size: Optional[Tuple[int, int]] = (320, 320),
+    ):
         self.mask_func = mask_func
         self.seed = seed
+        self.crop_size = crop_size
         self._dim_verified = False
 
     def __call__(self, sample: Dict[str, Any]) -> Dict[str, torch.Tensor]:
@@ -63,18 +91,23 @@ class SliceTransform:
             gt_complex = kspace_to_image_torch(kspace)
             target_mag = complex_abs(gt_complex)
 
-        # 4. Verify dimensions and align shapes (center crop if target is cropped, e.g. 320x320)
+        # 4. Consistent spatial preprocessing & normalization to standard (320, 320) FOV
+        zf_norm, target_norm = align_and_normalize_slice(
+            zf_mag,
+            target_mag,
+            crop_size=self.crop_size,
+        )
+
         if not self._dim_verified:
             print(
-                f"[Data Pipeline] Raw kspace shape: {tuple(kspace.shape)} | "
-                f"Zero-filled shape: {tuple(zf_mag.shape)} | "
-                f"Target shape: {tuple(target_mag.shape)}"
+                f"[Data Pipeline Verification] Raw k-space: {tuple(kspace.shape)} | "
+                f"Zero-Filled input: {tuple(zf_norm.shape)} | "
+                f"Target: {tuple(target_norm.shape)} | "
+                f"(Dimensions match: {zf_norm.shape == target_norm.shape})"
             )
             self._dim_verified = True
 
-        zf_norm, target_norm = align_and_normalize_slice(zf_mag, target_mag)
-
-        # Reshape to [1, H, W] for 2D Conv
+        # Reshape to [1, H, W] for 2D Convolution
         zf_tensor = zf_norm.unsqueeze(0).float()
         target_tensor = target_norm.unsqueeze(0).float()
 
@@ -93,7 +126,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    scaler: Optional[Any] = None,
 ) -> float:
     """Run one training epoch."""
     model.train()
@@ -109,7 +142,7 @@ def train_epoch(
         optimizer.zero_grad()
 
         if use_amp:
-            with torch.cuda.amp.autocast():
+            with get_autocast(device):
                 pred = model(x)
                 loss_dict = criterion(pred, y)
                 loss = loss_dict["loss"]
@@ -153,7 +186,6 @@ def validate_epoch(
             running_loss += loss_dict["loss"].item() * x.size(0)
             count += x.size(0)
 
-            # Compute slice metrics on CPU numpy arrays
             y_np = y.squeeze().cpu().numpy()
             pred_np = pred.squeeze().cpu().numpy()
 
@@ -187,6 +219,17 @@ def train_unet(
     """
     Main training execution function for U-Net baseline.
     """
+    # Sanity check: Disallow training on validation data for real experiments
+    if not is_smoke_test and val_data_dir:
+        train_path_resolved = Path(data_dir).resolve()
+        val_path_resolved = Path(val_data_dir).resolve()
+        if train_path_resolved == val_path_resolved:
+            raise ValueError(
+                f"FATAL ERROR: Training directory '{data_dir}' is identical to validation directory '{val_data_dir}'.\n"
+                f"Real scientific training must require a separate official fastMRI training directory.\n"
+                f"If you intended to run a pipeline verification test, explicitly pass --smoke_test (is_smoke_test=True)."
+            )
+
     set_seed(seed)
 
     if device_str is not None:
@@ -197,7 +240,7 @@ def train_unet(
     print(f"\n========================================================")
     print(f"  Training U-Net Baseline ({acceleration}x Acceleration)")
     print(f"  Execution Device  : {device}")
-    print(f"  Mode              : {'SMOKE TEST' if is_smoke_test else 'Standard Training'}")
+    print(f"  Mode              : {'SMOKE TEST (Pipeline Verification Only)' if is_smoke_test else 'Standard Experiment'}")
     print(f"  Epochs            : {epochs}")
     print(f"  Learning Rate     : {learning_rate}")
     print(f"  Subset Files      : {subset_files if subset_files else 'Full'}")
@@ -209,9 +252,9 @@ def train_unet(
         accelerations=[acceleration],
         seed=seed,
     )
-    transform = SliceTransform(mask_func=mask_func, seed=seed)
+    transform = SliceTransform(mask_func=mask_func, seed=seed, crop_size=(320, 320))
 
-    # Dataset and Dataloader
+    # Training Dataset
     train_dataset = FastMRIDataset(
         root_dir=data_dir,
         transform=transform,
@@ -228,6 +271,7 @@ def train_unet(
     )
     print(f"Training dataset loaded: {len(train_dataset)} slices across files.")
 
+    # Validation Dataset
     val_loader = None
     if val_data_dir and Path(val_data_dir).exists():
         val_dataset = FastMRIDataset(
@@ -242,7 +286,7 @@ def train_unet(
     # Model, Optimizer, Loss
     model = UNet(in_channels=1, out_channels=1, base_channels=32).to(device)
 
-    # U-Net Baseline uses pure image L1 loss (lambda_kspace=0.0)
+    # U-Net Baseline uses pure image L1 loss (lambda_kspace=0.0 strictly maintained)
     criterion = TotalReconstructionLoss(
         image_loss_type="l1",
         lambda_image=1.0,
@@ -250,8 +294,7 @@ def train_unet(
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-
-    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+    scaler = create_grad_scaler(device)
 
     # Checkpoints & Logs setup
     Path(checkpoints_dir).mkdir(parents=True, exist_ok=True)
@@ -289,6 +332,7 @@ def train_unet(
                         "optimizer_state_dict": optimizer.state_dict(),
                         "best_psnr": best_val_psnr,
                         "acceleration": acceleration,
+                        "is_smoke_test": is_smoke_test,
                     },
                     best_ckpt_path,
                 )
@@ -305,6 +349,7 @@ def train_unet(
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "acceleration": acceleration,
+            "is_smoke_test": is_smoke_test,
         },
         latest_ckpt_path,
     )
@@ -335,4 +380,3 @@ def train_unet(
         "history_file": str(history_file),
         "history": history,
     }
-

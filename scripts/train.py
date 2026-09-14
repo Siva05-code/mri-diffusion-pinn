@@ -3,13 +3,11 @@
 CLI Training Script for U-Net MRI Reconstruction Baseline.
 
 Usage:
-    # Quick smoke test on 2 files for 1 epoch:
+    # 1. Pipeline Smoke Test (uses validation subset for code verification only):
     python3 scripts/train.py --config configs/base.yaml --accel 4 --epochs 1 --subset_files 2 --smoke_test
 
-    # Standard training on 4x acceleration:
+    # 2. Standard Real Training on Official Training Set:
     python3 scripts/train.py --config configs/base.yaml --accel 4 --epochs 10
-
-    # Standard training on 8x acceleration:
     python3 scripts/train.py --config configs/base.yaml --accel 8 --epochs 10
 """
 
@@ -33,14 +31,20 @@ def load_yaml(path: str) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train U-Net baseline for accelerated MRI reconstruction.")
+    parser = argparse.ArgumentParser(
+        description="Train U-Net baseline for accelerated MRI reconstruction."
+    )
     parser.add_argument("--config", type=str, default="configs/base.yaml", help="Path to base configuration YAML.")
     parser.add_argument("--accel", type=int, default=4, choices=[4, 8], help="Acceleration factor (4 or 8).")
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (overrides config).")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate (overrides config).")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size (default: 1).")
-    parser.add_argument("--subset_files", type=int, default=None, help="Limit number of H5 files used (for quick tests).")
-    parser.add_argument("--smoke_test", action="store_true", help="Designate run as a smoke test.")
+    parser.add_argument("--subset_files", type=int, default=None, help="Limit number of H5 files used (for quick runs).")
+    parser.add_argument(
+        "--smoke_test",
+        action="store_true",
+        help="Explicitly enable smoke-test mode (allows pipeline verification on validation subset).",
+    )
     parser.add_argument("--train_dir", type=str, default=None, help="Path to training data directory.")
     parser.add_argument("--val_dir", type=str, default=None, help="Path to validation data directory.")
     parser.add_argument("--device", type=str, default=None, help="Execution device ('cuda' or 'cpu').")
@@ -58,7 +62,7 @@ def main():
         accel_cfg = load_yaml(str(accel_yaml))
         cfg.setdefault("experiment", {}).update(accel_cfg.get("experiment", {}))
 
-    # 3. Resolve hyperparameters with CLI overrides
+    # 3. Resolve hyperparameters
     data_cfg = cfg.get("data", {})
     exp_cfg = cfg.get("experiment", {})
     train_cfg = cfg.get("training", {})
@@ -67,19 +71,32 @@ def main():
     train_dir = args.train_dir or data_cfg.get("train_dir")
     val_dir = args.val_dir or data_cfg.get("val_dir")
 
-    # If train directory does not exist, but val_dir does (e.g. initial download stage),
-    # allow running smoke test on the available validation subset.
-    if not Path(train_dir).exists():
-        if val_dir and Path(val_dir).exists():
-            print(f"[Note] Training directory '{train_dir}' not found.")
-            print(f"[Note] Falling back to validation directory '{val_dir}' for code verification / smoke testing.")
-            train_dir = val_dir
-            args.smoke_test = True
-        else:
+    # Sanity checks and validation-fallback gating
+    if not args.smoke_test:
+        if not train_dir or not Path(train_dir).exists():
             raise FileNotFoundError(
-                f"Neither training directory ('{train_dir}') nor validation directory ('{val_dir}') exists.\n"
-                f"Please ensure official fastMRI data has been downloaded."
+                f"Official training directory '{train_dir}' does not exist.\n"
+                f"Real scientific training requires the official fastMRI training dataset.\n"
+                f"Training on the validation set is strictly prohibited for real experiments.\n"
+                f"If you only intend to verify code and execution pipelines, run with --smoke_test."
             )
+        if val_dir and Path(train_dir).resolve() == Path(val_dir).resolve():
+            raise ValueError(
+                f"FATAL: Training directory ('{train_dir}') is identical to validation directory ('{val_dir}').\n"
+                f"Training on the validation set is prohibited for real experiments.\n"
+                f"To verify the pipeline using validation data, explicitly pass --smoke_test."
+            )
+    else:
+        # Smoke test mode: allow using validation directory only for pipeline verification
+        if not train_dir or not Path(train_dir).exists():
+            if val_dir and Path(val_dir).exists():
+                print(f"[SMOKE TEST] Training directory '{train_dir}' not found.")
+                print(f"[SMOKE TEST] Using validation subset '{val_dir}' strictly for pipeline verification.")
+                train_dir = val_dir
+            else:
+                raise FileNotFoundError(
+                    f"Neither training directory ('{train_dir}') nor validation directory ('{val_dir}') exists."
+                )
 
     epochs = args.epochs or train_cfg.get("epochs", 5)
     learning_rate = args.lr or train_cfg.get("learning_rate", 1e-4)
@@ -90,7 +107,7 @@ def main():
 
     subset_files = args.subset_files
     if subset_files is None and args.smoke_test:
-        subset_files = 2  # default small file count for smoke test
+        subset_files = 2  # default 2 files for smoke test
 
     checkpoints_dir = paths_cfg.get("checkpoints_dir", "checkpoints")
     results_dir = paths_cfg.get("results_dir", "results")
@@ -116,4 +133,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

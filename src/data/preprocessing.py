@@ -5,7 +5,7 @@ Provides functions to compute magnitude images, normalize k-space and reconstruc
 center crop images, and format complex numbers for PyTorch processing.
 """
 
-from typing import Tuple, Union
+from typing import Tuple, Union, Optional
 import torch
 import numpy as np
 
@@ -39,7 +39,12 @@ def normalize_instance(data: torch.Tensor, eps: float = 1e-11):
 
 def center_crop(data: torch.Tensor, target_shape: Tuple[int, int]) -> torch.Tensor:
     """
-    Apply a center crop to the last two dimensions of the input tensor.
+    Apply a physical center crop to the last two dimensions of the input tensor.
+
+    In fastMRI knee data, the raw readout dimension (640) includes 2x frequency-encoding
+    oversampling to prevent wrap-around aliasing, and phase encoding (368) includes outer padding.
+    Center cropping removes this oversampling and padding to isolate the true 320x320 FOV
+    without any geometric resampling or aspect ratio distortion.
 
     Args:
         data (torch.Tensor): Input tensor [..., H, W]
@@ -54,7 +59,7 @@ def center_crop(data: torch.Tensor, target_shape: Tuple[int, int]) -> torch.Tens
         return data
 
     if curr_h < target_h or curr_w < target_w:
-        # If input is smaller than requested target, no cropping is possible without padding
+        # If input is smaller than requested target, preserve native dimensions
         return data
 
     h_from = (curr_h - target_h) // 2
@@ -65,25 +70,40 @@ def center_crop(data: torch.Tensor, target_shape: Tuple[int, int]) -> torch.Tens
 def align_and_normalize_slice(
     zf_image: torch.Tensor,
     target_image: torch.Tensor,
+    crop_size: Optional[Tuple[int, int]] = (320, 320),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Verifies actual spatial dimensions between zero-filled input and target image,
-    applies center cropping if target is cropped (e.g. 320x320 target vs 640x368 input),
-    and normalizes both to [0, 1] consistently.
+    Ensures zero-filled input and reference target undergo consistent spatial preprocessing:
+    1. If target is pre-cropped (e.g., fastMRI reconstruction_rss at 320x320), center-crop zf_image to match.
+    2. If both are raw IFFT (640x368) and crop_size is given, center-crop both to crop_size.
+    3. Guarantees identical (320, 320) spatial dimensions without bilinear/bicubic distortion.
+    4. Normalizes both inputs to [0, 1] consistently.
 
     Args:
         zf_image: Zero-filled magnitude image tensor [H_zf, W_zf]
         target_image: Reference target magnitude image tensor [H_tgt, W_tgt]
+        crop_size: Standard evaluation FOV (default: (320, 320))
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: (zf_norm, target_norm) matching in spatial shape.
+        Tuple[torch.Tensor, torch.Tensor]: (zf_norm, target_norm) with identical spatial shape.
     """
+    # Case 1: Target is already pre-cropped (e.g., fastMRI reconstruction_rss at 320x320)
     if zf_image.shape != target_image.shape:
-        # Check if target is a center crop of zero-filled image
-        if zf_image.shape[-2] >= target_image.shape[-2] and zf_image.shape[-1] >= target_image.shape[-1]:
-            zf_image = center_crop(zf_image, (target_image.shape[-2], target_image.shape[-1]))
+        target_shape = (target_image.shape[-2], target_image.shape[-1])
+        if zf_image.shape[-2] >= target_shape[0] and zf_image.shape[-1] >= target_shape[1]:
+            zf_image = center_crop(zf_image, target_shape)
         elif target_image.shape[-2] >= zf_image.shape[-2] and target_image.shape[-1] >= zf_image.shape[-1]:
             target_image = center_crop(target_image, (zf_image.shape[-2], zf_image.shape[-1]))
+
+    # Case 2: Both are still full k-space IFFT (640x368); crop both to standard FOV if requested
+    if crop_size is not None and zf_image.shape[-2:] != crop_size:
+        if zf_image.shape[-2] >= crop_size[0] and zf_image.shape[-1] >= crop_size[1]:
+            zf_image = center_crop(zf_image, crop_size)
+            target_image = center_crop(target_image, crop_size)
+
+    assert zf_image.shape == target_image.shape, (
+        f"Spatial dimension mismatch after alignment: zf {zf_image.shape} vs target {target_image.shape}"
+    )
 
     zf_norm = normalize_zero_one(zf_image)
     target_norm = normalize_zero_one(target_image)
