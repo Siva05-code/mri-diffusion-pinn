@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# MRI dataset
+data/raw/*
+data/processed/*
+*.h5
+*.hdf5
+
+# Model checkpoints
+checkpoints/*
+*.pt
+*.pth
+*.ckpt
+
+# Experiment outputs
+results/logs/*
+results/reconstructions/*
+results/*.csv
+
+# Kaggle
+/kaggle/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
