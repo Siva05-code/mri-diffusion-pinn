@@ -140,9 +140,11 @@ mri-diffusion-pinn/
 - NMSE
 - k-space reconstruction error
 ## 5. New Developer Quick Start
+## 5. Reproducible Kaggle Setup
 
 ## Experiments
 Follow these step-by-step instructions to initialize the project in a fresh Kaggle GPU environment:
+The project workflow for executing reproducible GPU experiments on Kaggle follows this pipeline:
 
 Experiments will evaluate reconstruction quality under different acceleration factors and sampling masks, including 4× and 8× acceleration.
 1. **Fork/Clone Repository**: Clone this repository to your local machine or directly inside your Kaggle notebook session.
@@ -154,8 +156,41 @@ Experiments will evaluate reconstruction quality under different acceleration fa
 7. **Run Data Inspection**: Open and run `notebooks/02_kspace_inspection.ipynb` to inspect HDF5 slices and verify inverse FFT reconstructions.
 8. **Run Zero-Filled Baseline**: Execute `notebooks/03_zero_filled_baseline.ipynb` to compute initial 4× and 8× zero-filled baseline metrics (PSNR, SSIM, NMSE).
 9. **Train & Evaluate Models**: Follow subsequent phase guidelines to train U-Net, Diffusion, and Physics-Refining architectures.
+```
+Local/GitHub
+    ↓
+Kaggle Notebook
+    ↓
+Clone repository
+    ↓
+Install dependencies
+    ↓
+Configure secrets
+    ↓
+Verify Kaggle CLI
+    ↓
+Configure dataset
+    ↓
+Download dataset
+    ↓
+Inspect .h5 files
+```
 
 ## Environment
+### Step-by-Step Instructions:
+
+1. **Open Kaggle**: Create a new GPU-accelerated Kaggle Notebook.
+2. **Clone Repository**:
+   ```bash
+   git clone https://github.com/Siva05-code/mri-diffusion-pinn.git
+   cd mri-diffusion-pinn
+   ```
+3. **Configure Secrets**: Add your Kaggle API credentials (`KAGGLE_USERNAME` and `KAGGLE_KEY`) to Kaggle Secrets (`Add-ons` -> `Secrets`).
+4. **Run Notebook 01**: Open `notebooks/01_environment.ipynb` to verify environment parity, GPU capabilities, dependencies, and Kaggle CLI access.
+5. **Configure Dataset Slug**: Update `data.kaggle_dataset` in `configs/base.yaml` with your verified Kaggle dataset slug (`OWNER/DATASET-NAME`).
+6. **Download Dataset**: Execute `python -m src.data.download_kaggle` to download and extract dataset HDF5 files to `/kaggle/working/data/fastmri`.
+7. **Inspect .h5 Files**: Run `notebooks/02_kspace_inspection.ipynb` to inspect k-space matrices and test inverse FFT reconstructions.
+
 ---
 
 Training and GPU-based experiments are performed using Kaggle GPU environments.
@@ -170,8 +205,12 @@ To download datasets programmatically without hardcoding tokens:
 - **Kaggle API Key**: In your Kaggle account settings, generate a `kaggle.json` API token.
 - **Kaggle Secrets (Notebooks)**: Navigate to `Add-ons` -> `Secrets` in your Kaggle notebook editor. Add `KAGGLE_USERNAME` and `KAGGLE_KEY`.
 - **Private Repository Cloning**: If working in a private repo, store a GitHub Personal Access Token (PAT) as a Kaggle Secret `GH_TOKEN` and clone via environment variables:
+- **Kaggle API Credentials**: In your Kaggle settings, generate an API token (`kaggle.json`).
+- **Kaggle Secrets (Notebooks)**: In your Kaggle notebook editor, navigate to `Add-ons` -> `Secrets`. Set `KAGGLE_USERNAME` and `KAGGLE_KEY`.
+- **Private Repository Access**: If using a private repository, store a GitHub Personal Access Token (PAT) as Kaggle Secret `GH_TOKEN` and clone securely:
   ```bash
   git clone https://${GH_TOKEN}@github.com/USER/mri-diffusion-pinn.git
+  git clone https://${GH_TOKEN}@github.com/Siva05-code/mri-diffusion-pinn.git
   ```
 
 ---
@@ -187,6 +226,7 @@ project:
 data:
   dataset_source: "kaggle"
   kaggle_dataset: ""  # Developer sets this to "OWNER/DATASET-NAME"
+  kaggle_dataset: ""  # Set by developer to "OWNER/DATASET-NAME"
   data_dir: "/kaggle/working/data/fastmri"
 
 experiment:
@@ -219,6 +259,7 @@ evaluation:
 - **SSIM**: Structural Similarity Index Measure
 - **NMSE**: Normalized Mean Squared Error
 - **k-space Consistency Error**: Relative $\ell_2$ norm difference in measured k-space coordinates
+- **k-space Consistency Error**: Relative $\ell_2$ norm error in acquired k-space domain
 
 ### Baselines & Ablations
 1. **Zero-Filled Reconstruction**

@@ -8,4 +8,3 @@ pandas
 pyyaml
 tqdm
 tensorboard
-tensorboard
