@@ -1,17 +1,12 @@
-# Physics-Informed Diffusion-PINN Framework for MRI Image Reconstruction
 # Physics-Informed Diffusion-PINN Framework for Accelerated MRI Image Reconstruction
 
-This repository contains the implementation of a physics-informed deep learning framework for accelerated MRI image reconstruction from undersampled k-space data.
-This repository contains the official reproducible PyTorch implementation of a physics-informed deep learning reconstruction framework for accelerated Magnetic Resonance Imaging (MRI).
+This repository contains the official reproducible PyTorch implementation of a physics-informed deep learning reconstruction framework for accelerated Magnetic Resonance Imaging (MRI) using the **official NYU fastMRI dataset**.
 
-## Project Overview
 ---
 
-MRI reconstruction can be formulated as an inverse problem:
-## 1. Project Overview
+## 1. Project Overview & Research Formulation
 
-y = F(x) + ε
-Magnetic Resonance Imaging (MRI) scanners collect raw measurement samples in **k-space** (Fourier domain). To reduce scan acquisition time and improve patient comfort, accelerated MRI undersamples k-space data. The inverse reconstruction problem is formulated as:
+Magnetic Resonance Imaging (MRI) scanners collect raw frequency measurements in **k-space**. To reduce scan acquisition time and patient discomfort, accelerated MRI undersamples k-space data. The inverse reconstruction problem is modeled as:
 
 $$\mathbf{y} = \mathcal{F}(\mathbf{x}) + \boldsymbol{\varepsilon}$$
 
@@ -19,25 +14,14 @@ where:
 - $\mathbf{x} \in \mathbb{C}^N$ is the fully sampled ground-truth MRI image.
 - $\mathbf{y} \in \mathbb{C}^M$ ($M \ll N$) is the measured undersampled k-space data.
 - $\mathcal{F} = \mathbf{M} \mathcal{F}_{\text{full}}$ is the undersampled Fourier forward acquisition operator ($\mathbf{M}$ is the undersampling mask, $\mathcal{F}_{\text{full}}$ is the 2D Discrete Fourier Transform).
-- $\boldsymbol{\varepsilon}$ represents measurement noise.
+- $\boldsymbol{\varepsilon}$ represents acquisition noise.
 
-- x is the original MRI image
-- F is the undersampled Fourier acquisition operator
-- y is the measured k-space data
-- ε represents measurement noise
 ---
 
-The proposed framework combines:
-## 2. Research Architecture
+## 2. Research Architecture & Objectives
 
-1. Diffusion-based image reconstruction
-2. Physics-informed refinement
-3. Fourier/k-space consistency
-4. Data fidelity
-5. Image-domain reconstruction losses
-Our framework integrates generative diffusion probabilistic modeling with explicit physics-informed data consistency refinement:
+Our framework combines generative diffusion probabilistic models with explicit physics-informed data-consistency refinement:
 
-## Dataset
 ```
 Undersampled k-space (y)
           ↓
@@ -45,192 +29,175 @@ Diffusion-based Reconstruction Model
           ↓
 Initial Reconstructed Image (x_init)
           ↓
-Physics-Informed Refinement Operator (Data Consistency / Fourier Forward Model)
+Physics-Informed Refinement Operator (Fourier Forward Model & Data Consistency)
           ↓
 Final Reconstructed MRI Image (x_final)
 ```
 
-The project uses the fastMRI dataset.
+### Composite Objective Function
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{image}} + \alpha \mathcal{L}_{\text{kspace}} + \beta \mathcal{L}_{\text{physics}}$$
+
+- **$\mathcal{L}_{\text{image}}$**: Image-domain reconstruction loss (e.g. $\ell_1$ / SSIM loss between reconstructed image and ground truth).
+- **$\mathcal{L}_{\text{kspace}}$**: K-space data-consistency loss ($\|\mathbf{M} \odot (\mathcal{F}(\mathbf{x}) - \mathbf{y})\|_2^2$).
+- **$\mathcal{L}_{\text{physics}}$**: Physics-informed regularizers (e.g. gradient smoothness / total variation).
+
 ---
 
-Raw MRI data is not stored in this repository.
-## 3. Terminology & Research Methodology Note
+## 3. Technical Clarification on "PINN" Terminology
 
-## Experimental Pipeline
 > [!IMPORTANT]
-> **Clarification on "PINN" Terminology**:
-> Classical Physics-Informed Neural Networks (PINNs) typically minimize partial differential equation (PDE) residuals. In this MRI reconstruction framework, "physics-informed" refers to enforcing **MRI acquisition domain constraints** via the **Fourier forward operator $\mathcal{F}$** and **k-space data consistency**. It does not use PDE spatial/temporal differential operators. All mathematical formulations strictly reflect physical MRI k-space sampling and Fourier transform properties.
+> **Technical Clarification**:
+> Classical Physics-Informed Neural Networks (PINNs) typically minimize partial differential equation (PDE) residuals. In this MRI reconstruction framework, "physics-informed" denotes enforcing **physical MRI acquisition forward operators ($\mathcal{F}$)** and **k-space data-consistency constraints** in the Fourier frequency domain. It does not solve spatiotemporal PDE systems. All mathematical operators directly implement the discrete Fourier forward problem $y = \mathcal{F}(x) + \varepsilon$.
 
-Undersampled k-space
-        ↓
-Diffusion reconstruction
-        ↓
-Initial MRI image
-        ↓
-Physics-informed refinement
-        ↓
-Final reconstructed MRI
 ---
 
-## Baselines
-## 4. Repository Structure
+## 4. Official NYU fastMRI Dataset Access
 
-- Zero-filled reconstruction
-- U-Net reconstruction
-- Diffusion-only reconstruction
-- Proposed Diffusion + Physics-informed refinement
+This project exclusively uses the **official NYU fastMRI dataset** (single-coil knee MRI for initial development and validation).
+
+### Dataset Policy & Privacy
+- **Official Access Required**: Register and request access at the [official NYU fastMRI portal](https://fastmri.med.nyu.edu/).
+- **No Raw Data in Git**: No `.h5`, `.tar`, `.tar.xz`, or dataset directories are committed to GitHub (enforced by `.gitignore`).
+- **Private Presigned URLs**: Official NYU download URLs are private Amazon S3 presigned links that expire.
+  - **NEVER** commit, hardcode, or paste signed URLs in repository files, configs, or public notebooks.
+  - Signed URLs are supplied dynamically at runtime via **Kaggle Secrets** or environment variables (`FASTMRI_VAL_URL`, `FASTMRI_TRAIN_URL`).
+
+### Storage-Efficient Streaming Extraction (Kaggle-Optimized)
+Standard Kaggle environments offer limited working storage (`/kaggle/working`). The complete fastMRI training archive exceeds 72+ GB compressed (160+ GB uncompressed) and will exceed Kaggle disk quotas if downloaded entirely.
+
+Our pipeline implements **selective streaming extraction** via `src/data/download_fastmri.py`:
+- Streams the signed HTTP response over the network.
+- Decompresses and extracts only a configurable development subset (e.g. 10 validation files, 30 training files) directly to disk.
+- Terminates the network stream immediately once the target quota is reached, keeping disk utilization under 1–3 GB.
+- Full benchmark evaluation can scale up by configuring `num_val_files` and `num_train_files` in `configs/base.yaml`.
+
+---
+
+## 5. Repository Structure
+
 ```
 mri-diffusion-pinn/
 │
 ├── README.md                 # Master project documentation
 ├── requirements.txt          # Python dependencies (excluding base PyTorch/CUDA)
-├── .gitignore                # Git exclusions (datasets, checkpoints, credentials)
+├── .gitignore                # Excludes datasets (*.h5, *.tar.xz), checkpoints, secrets
 │
-├── configs/                  # Experiment configuration files
-│   ├── base.yaml             # Base settings & dataset slug configuration
-│   ├── accel4.yaml           # 4x acceleration hyperparameter settings
-│   └── accel8.yaml           # 8x acceleration hyperparameter settings
+├── configs/                  # Experiment configurations
+│   ├── base.yaml             # Core parameters & fastMRI development subset sizes
+│   ├── accel4.yaml           # 4x acceleration configuration
+│   └── accel8.yaml           # 8x acceleration configuration
 │
-├── src/                      # Source package
+├── src/                      # Modular source package
 │   ├── __init__.py
-│   ├── data/                 # Downloaders, dataset wrappers, preprocessing, masks
-│   ├── models/               # U-Net, Diffusion, PINN Refiner, Proposed architecture
-│   ├── physics/              # PyTorch FFT operators, forward model, data consistency
-│   ├── losses/               # Image-domain, k-space, and composite loss functions
-│   ├── training/             # Modular training scripts for models
+│   ├── data/                 # Official fastMRI downloader, dataset, preprocessing, masks
+│   │   ├── download_fastmri.py
+│   │   ├── dataset.py
+│   │   ├── preprocessing.py
+│   │   └── undersampling.py
+│   ├── models/               # U-Net, Diffusion, Refinement, Proposed model
+│   ├── physics/              # Centered PyTorch 2D FFT / IFFT forward operators
+│   │   └── fft.py
+│   ├── losses/               # Image loss, k-space loss, composite objective
+│   ├── training/             # Modular training scripts
 │   ├── evaluation/           # Metrics (PSNR, SSIM, NMSE, k-space error)
-│   └── visualization/        # Error maps, k-space plots, image reconstructions
+│   │   └── metrics.py
+│   └── visualization/        # 5-panel reconstructions and error maps
+│       ├── reconstructions.py
+│       └── error_maps.py
 │
-├── scripts/                  # CLI scripts
-│   ├── prepare_data.py       # Data preparation utility
-│   ├── train.py              # Unified training launcher
-│   └── evaluate.py           # Unified evaluation launcher
+├── scripts/                  # Command-line runners
+│   ├── prepare_data.py
+│   ├── train.py
+│   └── evaluate.py
 │
-├── notebooks/                # Step-by-step Jupyter notebooks for Kaggle / Local
-│   ├── 01_environment.ipynb  # Environment setup, GitHub clone, GPU & Kaggle check
-│   ├── 02_kspace_inspection.ipynb  # HDF5 inspection, k-space viz, inverse FFT
+├── notebooks/                # Step-by-step Jupyter notebooks for Kaggle
+│   ├── 01_environment.ipynb  # Environment setup, secret check, fastMRI streaming download
+│   ├── 02_kspace_inspection.ipynb  # HDF5 inspection, k-space log-mag viz, IFFT reconstruction
 │   └── 03_zero_filled_baseline.ipynb # 4x and 8x zero-filled baseline evaluation
 │
-├── experiments/              # Experiment logs, configs, and metrics
-│   ├── zero_filled/
-│   ├── unet/
-│   ├── diffusion/
-│   ├── diffusion_pinn/
-│   └── ablations/
-│
-├── results/                  # Generated plots, quantitative tables, figures
+├── experiments/              # Experiment outputs and metrics
+├── results/                  # Generated figures, tables, logs
 │   ├── figures/
 │   ├── tables/
 │   ├── reconstructions/
 │   └── logs/
 │
-├── checkpoints/              # Model weights (.pt / .pth, ignored by Git)
-│
-└── paper/                    # Research manuscript assets
-    ├── figures/
-    ├── tables/
-    └── manuscript/
+├── checkpoints/              # Model weights (.gitkept, weights ignored)
+└── paper/                    # Manuscript tables and figures
 ```
 
-## Evaluation Metrics
 ---
 
-- PSNR
-- SSIM
-- NMSE
-- k-space reconstruction error
-## 5. New Developer Quick Start
-## 5. Reproducible Kaggle Setup
+## 6. Reproducible Kaggle Setup Guide
 
-## Experiments
-Follow these step-by-step instructions to initialize the project in a fresh Kaggle GPU environment:
-The project workflow for executing reproducible GPU experiments on Kaggle follows this pipeline:
-
-Experiments will evaluate reconstruction quality under different acceleration factors and sampling masks, including 4× and 8× acceleration.
-1. **Fork/Clone Repository**: Clone this repository to your local machine or directly inside your Kaggle notebook session.
-2. **Open Kaggle**: Create a new GPU-accelerated Kaggle Notebook.
-3. **Configure Kaggle Secret**: Add your Kaggle API key (`KAGGLE_USERNAME` and `KAGGLE_KEY`) to Kaggle Secrets or set up `~/.kaggle/kaggle.json`.
-4. **Run Notebook 01**: Execute `notebooks/01_environment.ipynb` to verify Python, PyTorch, GPU acceleration, and Kaggle CLI access.
-5. **Configure Dataset Slug**: Update `data.kaggle_dataset` in `configs/base.yaml` with the verified Kaggle dataset slug (`OWNER/DATASET-NAME`).
-6. **Download Dataset**: Execute `python -m src.data.download_kaggle` to download and extract the dataset to `/kaggle/working/data/fastmri`.
-7. **Run Data Inspection**: Open and run `notebooks/02_kspace_inspection.ipynb` to inspect HDF5 slices and verify inverse FFT reconstructions.
-8. **Run Zero-Filled Baseline**: Execute `notebooks/03_zero_filled_baseline.ipynb` to compute initial 4× and 8× zero-filled baseline metrics (PSNR, SSIM, NMSE).
-9. **Train & Evaluate Models**: Follow subsequent phase guidelines to train U-Net, Diffusion, and Physics-Refining architectures.
 ```
-Local/GitHub
-    ↓
-Kaggle Notebook
-    ↓
-Clone repository
-    ↓
-Install dependencies
-    ↓
-Configure secrets
-    ↓
-Verify Kaggle CLI
-    ↓
-Configure dataset
-    ↓
-Download dataset
-    ↓
-Inspect .h5 files
+GitHub Repository
+       ↓
+Kaggle GPU Notebook
+       ↓
+Set Kaggle Secrets (FASTMRI_VAL_URL, FASTMRI_TRAIN_URL)
+       ↓
+Run Notebook 01 (Environment & Selective fastMRI Streaming Download)
+       ↓
+Run Notebook 02 (K-Space Inspection & IFFT Reconstruction)
+       ↓
+Run Notebook 03 (Zero-Filled 4× and 8× Baseline Benchmark)
+       ↓
+Model Training & Ablations (U-Net → Diffusion → Proposed Diffusion-PINN)
 ```
 
-## Environment
 ### Step-by-Step Instructions:
 
-1. **Open Kaggle**: Create a new GPU-accelerated Kaggle Notebook.
+1. **Create Kaggle GPU Notebook**: Launch a Kaggle notebook with GPU acceleration (P100 or T4 x2).
 2. **Clone Repository**:
    ```bash
    git clone https://github.com/Siva05-code/mri-diffusion-pinn.git
    cd mri-diffusion-pinn
    ```
-3. **Configure Secrets**: Add your Kaggle API credentials (`KAGGLE_USERNAME` and `KAGGLE_KEY`) to Kaggle Secrets (`Add-ons` -> `Secrets`).
-4. **Run Notebook 01**: Open `notebooks/01_environment.ipynb` to verify environment parity, GPU capabilities, dependencies, and Kaggle CLI access.
-5. **Configure Dataset Slug**: Update `data.kaggle_dataset` in `configs/base.yaml` with your verified Kaggle dataset slug (`OWNER/DATASET-NAME`).
-6. **Download Dataset**: Execute `python -m src.data.download_kaggle` to download and extract dataset HDF5 files to `/kaggle/working/data/fastmri`.
-7. **Inspect .h5 Files**: Run `notebooks/02_kspace_inspection.ipynb` to inspect k-space matrices and test inverse FFT reconstructions.
-
----
-
-Training and GPU-based experiments are performed using Kaggle GPU environments.
-## 6. Kaggle Authentication & Secrets Management
-
-GitHub is used for source-code version control, while experiment outputs and trained checkpoints are downloaded from Kaggle for local analysis.
-To download datasets programmatically without hardcoding tokens:
-
-> [!CAUTION]
-> **NEVER hardcode API credentials, tokens, or Kaggle API keys in source files, notebooks, or git commits.**
-
-- **Kaggle API Key**: In your Kaggle account settings, generate a `kaggle.json` API token.
-- **Kaggle Secrets (Notebooks)**: Navigate to `Add-ons` -> `Secrets` in your Kaggle notebook editor. Add `KAGGLE_USERNAME` and `KAGGLE_KEY`.
-- **Private Repository Cloning**: If working in a private repo, store a GitHub Personal Access Token (PAT) as a Kaggle Secret `GH_TOKEN` and clone via environment variables:
-- **Kaggle API Credentials**: In your Kaggle settings, generate an API token (`kaggle.json`).
-- **Kaggle Secrets (Notebooks)**: In your Kaggle notebook editor, navigate to `Add-ons` -> `Secrets`. Set `KAGGLE_USERNAME` and `KAGGLE_KEY`.
-- **Private Repository Access**: If using a private repository, store a GitHub Personal Access Token (PAT) as Kaggle Secret `GH_TOKEN` and clone securely:
-  ```bash
-  git clone https://${GH_TOKEN}@github.com/USER/mri-diffusion-pinn.git
-  git clone https://${GH_TOKEN}@github.com/Siva05-code/mri-diffusion-pinn.git
-  ```
+3. **Configure Secrets**:
+   - In Kaggle Notebook: Click **Add-ons** → **Secrets**.
+   - Add secret `FASTMRI_VAL_URL` with your official signed S3 link for `knee_singlecoil_val.tar.xz`.
+   - (Optional) Add `FASTMRI_TRAIN_URL` with your signed link for `knee_singlecoil_train.tar.xz`.
+4. **Install Requirements**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+5. **Run Data Extraction**:
+   ```bash
+   python -m src.data.download_fastmri --split val --max-files 10
+   ```
+6. **Run Inspection & Baseline**:
+   - Open `notebooks/02_kspace_inspection.ipynb` to verify raw k-space and IFFT recon.
+   - Open `notebooks/03_zero_filled_baseline.ipynb` to run the 4× and 8× zero-filled baseline and save metrics.
 
 ---
 
 ## 7. Configuration Strategy
 
-Project configuration is stored in YAML format under `configs/`:
+Configured via YAML in `configs/base.yaml`:
 
 ```yaml
 project:
   name: "mri-diffusion-pinn"
+  description: "Physics-Informed Diffusion-PINN Framework for Accelerated MRI Image Reconstruction"
+
+dataset:
+  name: "fastMRI"
+  anatomy: "knee"
+  modality: "singlecoil"
+  source: "official_NYU_fastMRI"
 
 data:
-  dataset_source: "kaggle"
-  kaggle_dataset: ""  # Developer sets this to "OWNER/DATASET-NAME"
-  kaggle_dataset: ""  # Set by developer to "OWNER/DATASET-NAME"
-  data_dir: "/kaggle/working/data/fastmri"
+  dataset_root: "/kaggle/working/data/fastmri"
+  train_dir: "/kaggle/working/data/fastmri/knee_singlecoil_train"
+  val_dir: "/kaggle/working/data/fastmri/knee_singlecoil_val"
+  num_train_files: 30
+  num_val_files: 10
+  image_size: [320, 320]
 
 experiment:
   acceleration: 4
+  center_fraction: 0.08
   seed: 42
 
 training:
@@ -242,6 +209,10 @@ physics:
   lambda_kspace: 1.0
   lambda_physics: 1.0
 
+paths:
+  checkpoints_dir: "checkpoints"
+  results_dir: "results"
+
 evaluation:
   metrics:
     - psnr
@@ -252,26 +223,25 @@ evaluation:
 
 ---
 
-## 8. Evaluation Metrics & Baselines
+## 8. Baselines & Evaluation Metrics
+
+### Models
+1. **Zero-Filled Baseline**: Direct inverse 2D FFT of zero-padded undersampled k-space $\mathbf{x}_{\text{zf}} = \mathcal{F}^{-1}(\mathbf{y}_{\text{us}})$.
+2. **U-Net Baseline**: Standard deep convolutional baseline trained on paired undersampled and ground-truth images.
+3. **Diffusion-Only Model**: Denoising diffusion probabilistic model (DDPM) conditioned on undersampled observations.
+4. **Proposed Physics-Informed Diffusion**: Generative diffusion model integrated with explicit Fourier data-consistency refinement.
 
 ### Quantitative Metrics
-- **PSNR**: Peak Signal-to-Noise Ratio (dB)
-- **SSIM**: Structural Similarity Index Measure
-- **NMSE**: Normalized Mean Squared Error
-- **k-space Consistency Error**: Relative $\ell_2$ norm difference in measured k-space coordinates
-- **k-space Consistency Error**: Relative $\ell_2$ norm error in acquired k-space domain
-
-### Baselines & Ablations
-1. **Zero-Filled Reconstruction**
-2. **U-Net Baseline**
-3. **Diffusion-Only Model**
-4. **Proposed Physics-Informed Diffusion (Diffusion + Data Consistency)**
+- **PSNR (Peak Signal-to-Noise Ratio)**: Evaluated against fully sampled ground-truth images.
+- **SSIM (Structural Similarity Index)**: Evaluated on normalized image magnitudes.
+- **NMSE (Normalized Mean Squared Error)**: $\|\mathbf{x}_{\text{pred}} - \mathbf{x}_{\text{gt}}\|_2^2 / \|\mathbf{x}_{\text{gt}}\|_2^2$.
+- **K-Space Data Consistency Error**: Relative $\ell_2$ difference between acquired k-space and forward FFT of reconstruction.
 
 ---
 
-## 9. Security & Reproducibility Guidelines
+## 9. Security & Cleanliness Checklist
 
-- **No Dataset Files in Git**: All `.h5`, `.hdf5`, and dataset directories are ignored by `.gitignore`.
-- **No Checkpoints in Git**: All `.pt`, `.pth`, and `.ckpt` files are excluded.
-- **Fixed Random Seeds**: All random number generators (PyTorch, NumPy, Python) are seeded with `seed: 42` for exact reproducibility.
-- **Environment Parity**: PyTorch and CUDA versions supplied by Kaggle runtime environment are verified directly in `notebooks/01_environment.ipynb`.
+- [x] Zero raw MRI data committed to Git.
+- [x] Zero private signed URLs or AWS keys committed or displayed in code or logs.
+- [x] Streaming selective extraction ensures Kaggle disk quota is never exceeded.
+- [x] All third-party dataset dependencies removed.

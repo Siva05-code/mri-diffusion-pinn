@@ -9,12 +9,16 @@ dataset:
   source: "official_NYU_fastMRI"
 
 data:
-  dataset_source: "kaggle"
-  kaggle_dataset: "arafatshovon/fastmri-knee-val"
-  data_dir: "/kaggle/working/data/fastmri"
+  dataset_root: "/kaggle/working/data/fastmri"
+  train_dir: "/kaggle/working/data/fastmri/knee_singlecoil_train"
+  val_dir: "/kaggle/working/data/fastmri/knee_singlecoil_val"
+  num_train_files: 30
+  num_val_files: 10
+  image_size: [320, 320]
 
 experiment:
   acceleration: 4
+  center_fraction: 0.08
   seed: 42
 
 training:
@@ -25,6 +29,10 @@ training:
 physics:
   lambda_kspace: 1.0
   lambda_physics: 1.0
+
+paths:
+  checkpoints_dir: "checkpoints"
+  results_dir: "results"
 
 evaluation:
   metrics:

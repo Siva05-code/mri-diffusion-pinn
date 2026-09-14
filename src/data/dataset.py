@@ -1,7 +1,8 @@
 """
 FastMRI HDF5 PyTorch Dataset Wrapper.
 
-Loads raw k-space HDF5 files, parses slices, and formats complex PyTorch tensors.
+Loads raw k-space HDF5 files from the official NYU fastMRI dataset, parses slices,
+and formats complex PyTorch tensors.
 """
 
 import os
@@ -17,7 +18,7 @@ class FastMRIDataset(Dataset):
     """
     PyTorch Dataset for single-coil fastMRI raw k-space HDF5 files.
     """
-    def __init__(self, root_dir: str, transform: Optional[Callable] = None):
+    def __init__(self, root_dir: str, transform: Optional[Callable] = None, max_files: Optional[int] = None):
         self.root_dir = Path(root_dir)
         self.transform = transform
         self.examples = []
@@ -27,6 +28,9 @@ class FastMRIDataset(Dataset):
 
         # Index all .h5 / .hdf5 files and their slice counts
         h5_files = sorted(list(self.root_dir.glob("*.h5")) + list(self.root_dir.glob("*.hdf5")))
+        if max_files is not None and max_files > 0:
+            h5_files = h5_files[:max_files]
+
         for fname in h5_files:
             try:
                 with h5py.File(fname, "r") as hf:
@@ -50,7 +54,7 @@ class FastMRIDataset(Dataset):
             )
             attrs = dict(hf.attrs)
 
-        # Convert complex numpy kspace to complex torch tensor or (height, width, 2)
+        # Convert complex numpy kspace to complex torch tensor
         if np.iscomplexobj(kspace_raw):
             kspace_tensor = torch.from_numpy(kspace_raw)
         else:
@@ -70,4 +74,3 @@ class FastMRIDataset(Dataset):
             sample = self.transform(sample)
 
         return sample
-
