@@ -18,11 +18,11 @@ ENV/
 *.ipynb_checkpoints
 
 # MRI dataset
-data/raw/*
-data/processed/*
+/data/raw/*
+/data/processed/*
 # MRI Datasets & Raw Data
-data/
-datasets/
+/data/
+/datasets/
 *.h5
 *.hdf5
 *.zip
