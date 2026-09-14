@@ -5,6 +5,7 @@ Generates side-by-side plots of ground truth, undersampled k-space, reconstructe
 """
 
 import os
+from typing import Optional, Dict
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -71,6 +72,7 @@ def plot_zero_filled_comparison(
     plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
 
     # 2. Undersampling Mask (guaranteed 2D)
+    # 2. Undersampling Mask
     im1 = axes[1].imshow(mask, cmap="gray", aspect="auto")
     axes[1].set_title(f"{accel_factor}x Undersampling Mask", fontsize=11)
     axes[1].axis("off")
@@ -94,6 +96,77 @@ def plot_zero_filled_comparison(
     axes[4].set_title(f"Error Map (|GT - Recon|)\nNMSE: {metrics['nmse']:.4f}", fontsize=10)
     axes[4].axis("off")
     plt.colorbar(im4, ax=axes[4], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return fig
+
+
+def plot_unet_comparison(
+    gt: np.ndarray,
+    zf: np.ndarray,
+    unet_pred: np.ndarray,
+    error_map: np.ndarray,
+    metrics: Dict[str, float],
+    accel_factor: int = 4,
+    zf_metrics: Optional[Dict[str, float]] = None,
+    save_path: Optional[str] = None,
+):
+    """
+    Plot 4-panel representative figure:
+    1. Ground Truth Reference
+    2. Zero-Filled Input
+    3. U-Net Reconstruction
+    4. Absolute Error Map (|GT - UNet|)
+    """
+    if hasattr(gt, "cpu"):
+        gt = gt.cpu().numpy()
+    gt = np.squeeze(np.asarray(gt))
+
+    if hasattr(zf, "cpu"):
+        zf = zf.cpu().numpy()
+    zf = np.squeeze(np.asarray(zf))
+
+    if hasattr(unet_pred, "cpu"):
+        unet_pred = unet_pred.cpu().numpy()
+    unet_pred = np.squeeze(np.asarray(unet_pred))
+
+    if hasattr(error_map, "cpu"):
+        error_map = error_map.cpu().numpy()
+    error_map = np.squeeze(np.asarray(error_map))
+
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4.5))
+
+    # 1. Ground Truth
+    im0 = axes[0].imshow(gt, cmap="gray")
+    axes[0].set_title("Ground Truth Reference", fontsize=11)
+    axes[0].axis("off")
+    plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+    # 2. Zero-Filled Input
+    im1 = axes[1].imshow(zf, cmap="gray")
+    zf_str = f"Zero-Filled Input ({accel_factor}x)"
+    if zf_metrics and "psnr" in zf_metrics:
+        zf_str += f"\nPSNR: {zf_metrics['psnr']:.2f}dB | SSIM: {zf_metrics['ssim']:.3f}"
+    axes[1].set_title(zf_str, fontsize=10)
+    axes[1].axis("off")
+    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+    # 3. U-Net Reconstruction
+    im2 = axes[2].imshow(unet_pred, cmap="gray")
+    title_str = f"U-Net Baseline ({accel_factor}x)\nPSNR: {metrics['psnr']:.2f}dB | SSIM: {metrics['ssim']:.3f}"
+    axes[2].set_title(title_str, fontsize=10)
+    axes[2].axis("off")
+    plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+    # 4. Error Map
+    im3 = axes[3].imshow(error_map, cmap="magma")
+    axes[3].set_title(f"Error Map (|GT - U-Net|)\nNMSE: {metrics['nmse']:.4f}", fontsize=10)
+    axes[3].axis("off")
+    plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04)
 
     plt.tight_layout()
     if save_path:
