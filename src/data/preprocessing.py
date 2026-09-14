@@ -69,24 +69,36 @@ def center_crop(data: torch.Tensor, target_shape: Tuple[int, int]) -> torch.Tens
 
 def align_and_normalize_slice(
     zf_image: torch.Tensor,
-    target_image: torch.Tensor,
+    target_image: Optional[torch.Tensor] = None,
     crop_size: Optional[Tuple[int, int]] = (320, 320),
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """
     Ensures zero-filled input and reference target undergo consistent spatial preprocessing:
-    1. If target is pre-cropped (e.g., fastMRI reconstruction_rss at 320x320), center-crop zf_image to match.
-    2. If both are raw IFFT (640x368) and crop_size is given, center-crop both to crop_size.
-    3. Guarantees identical (320, 320) spatial dimensions without bilinear/bicubic distortion.
-    4. Normalizes both inputs to [0, 1] consistently.
+    1. If target_image is provided:
+       - If target is pre-cropped (e.g., fastMRI reconstruction_rss at 320x320), center-crop zf_image to match.
+       - If both are raw IFFT (640x368) and crop_size is given, center-crop both to crop_size.
+       - Guarantees identical (320, 320) spatial dimensions without bilinear/bicubic distortion.
+       - Normalizes both inputs to [0, 1] consistently and returns (zf_norm, target_norm).
+    2. If target_image is None:
+       - Center-crops zf_image to crop_size (if specified) and normalizes to [0, 1].
+       - Returns zf_norm.
 
     Args:
         zf_image: Zero-filled magnitude image tensor [H_zf, W_zf]
-        target_image: Reference target magnitude image tensor [H_tgt, W_tgt]
+        target_image: Optional reference target magnitude image tensor [H_tgt, W_tgt]
         crop_size: Standard evaluation FOV (default: (320, 320))
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: (zf_norm, target_norm) with identical spatial shape.
+        Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+            (zf_norm, target_norm) if target_image is provided, else zf_norm.
     """
+    if target_image is None:
+        if crop_size is not None and zf_image.shape[-2:] != crop_size:
+            if zf_image.shape[-2] >= crop_size[0] and zf_image.shape[-1] >= crop_size[1]:
+                zf_image = center_crop(zf_image, crop_size)
+        return normalize_zero_one(zf_image)
+
+    # Both images provided:
     # Case 1: Target is already pre-cropped (e.g., fastMRI reconstruction_rss at 320x320)
     if zf_image.shape != target_image.shape:
         target_shape = (target_image.shape[-2], target_image.shape[-1])
