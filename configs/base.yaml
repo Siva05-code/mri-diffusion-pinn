@@ -4,7 +4,7 @@ project:
 
 data:
   dataset_source: "kaggle"
-  kaggle_dataset: ""  # Format: "OWNER/DATASET-NAME" (Must be configured by developer)
+  kaggle_dataset: "arafatshovon/fastmri-knee-val"
   data_dir: "/kaggle/working/data/fastmri"
 
 experiment:
@@ -26,4 +26,3 @@ evaluation:
     - ssim
     - nmse
     - kspace_error
-
