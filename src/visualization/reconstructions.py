@@ -21,7 +21,47 @@ def plot_zero_filled_comparison(
 ):
     """
     Plot 5-panel figure: GT, Mask, K-space Log-Mag, Zero-Filled Recon, Error Map.
+
+    Supports both 1D Cartesian masks (broadcast to 2D image shape) and already-2D masks.
     """
+    # Convert inputs to numpy arrays if needed
+    if hasattr(gt, "cpu"):
+        gt = gt.cpu().numpy()
+    gt = np.squeeze(np.asarray(gt))
+
+    if hasattr(mask, "cpu"):
+        mask = mask.cpu().numpy()
+    mask = np.squeeze(np.asarray(mask))
+
+    # Convert 1D Cartesian phase-encoding mask to 2D matching image dimensions
+    if mask.ndim == 1:
+        mask = np.broadcast_to(mask[None, :], gt.shape)
+    elif mask.ndim > 2:
+        mask = np.squeeze(mask)
+        if mask.ndim == 1:
+            mask = np.broadcast_to(mask[None, :], gt.shape)
+
+    if hasattr(zf_reconstruction, "cpu"):
+        zf_reconstruction = zf_reconstruction.cpu().numpy()
+    zf_reconstruction = np.squeeze(np.asarray(zf_reconstruction))
+
+    if hasattr(error_map, "cpu"):
+        error_map = error_map.cpu().numpy()
+    error_map = np.squeeze(np.asarray(error_map))
+
+    if hasattr(undersampled_kspace, "cpu"):
+        undersampled_kspace = undersampled_kspace.cpu().numpy()
+    undersampled_kspace = np.squeeze(np.asarray(undersampled_kspace))
+
+    # Compute k-space magnitude in log scale
+    if np.iscomplexobj(undersampled_kspace):
+        kspace_mag = np.abs(undersampled_kspace)
+    elif undersampled_kspace.ndim == 3 and undersampled_kspace.shape[-1] == 2:
+        kspace_mag = np.sqrt(undersampled_kspace[..., 0]**2 + undersampled_kspace[..., 1]**2)
+    else:
+        kspace_mag = np.abs(undersampled_kspace)
+    kspace_log = np.log(kspace_mag + 1e-9)
+
     fig, axes = plt.subplots(1, 5, figsize=(20, 4.5))
 
     # 1. Ground Truth Reference
@@ -30,14 +70,13 @@ def plot_zero_filled_comparison(
     axes[0].axis("off")
     plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
 
-    # 2. Undersampling Mask
+    # 2. Undersampling Mask (guaranteed 2D)
     im1 = axes[1].imshow(mask, cmap="gray", aspect="auto")
     axes[1].set_title(f"{accel_factor}x Undersampling Mask", fontsize=11)
     axes[1].axis("off")
     plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
 
     # 3. Undersampled K-Space Log Magnitude
-    kspace_log = np.log(np.abs(undersampled_kspace) + 1e-9)
     im2 = axes[2].imshow(kspace_log, cmap="gray")
     axes[2].set_title(f"{accel_factor}x Undersampled K-Space", fontsize=11)
     axes[2].axis("off")
@@ -62,4 +101,3 @@ def plot_zero_filled_comparison(
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return fig
-

@@ -71,6 +71,22 @@ def get_signed_url(split="val", cli_url=None):
     if env_val:
         return env_val.strip()
 
+    # 3. Check local .env file if present
+    env_file = Path(".env")
+    if env_file.exists():
+        try:
+            with open(env_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k in [secret_key, generic_key] and v:
+                            return v
+        except Exception:
+            pass
+
     return None
 
 
