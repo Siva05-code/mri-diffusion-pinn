@@ -2,6 +2,12 @@ project:
   name: "mri-diffusion-pinn"
   description: "Physics-Informed Diffusion-PINN Framework for Accelerated MRI Image Reconstruction"
 
+dataset:
+  name: "fastMRI"
+  anatomy: "knee"
+  modality: "singlecoil"
+  source: "official_NYU_fastMRI"
+
 data:
   dataset_source: "kaggle"
   kaggle_dataset: "arafatshovon/fastmri-knee-val"
