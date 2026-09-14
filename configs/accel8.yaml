@@ -1,0 +1,6 @@
+# 8x Acceleration Configuration
+experiment:
+  acceleration: 8
+  center_fractions: [0.04]
+  accelerations: [8]
+

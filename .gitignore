@@ -1,39 +1,81 @@
 # Python
+# Python / Cache
 __pycache__/
 *.py[cod]
+*$py.class
 *.so
+.Python
 
 # Virtual environments
 .venv/
 venv/
 env/
+ENV/
 
 # Jupyter
+# Jupyter / Notebooks
 .ipynb_checkpoints/
+*.ipynb_checkpoints
 
 # MRI dataset
 data/raw/*
 data/processed/*
+# MRI Datasets & Raw Data
+data/
+datasets/
 *.h5
 *.hdf5
+*.zip
+*.tar.gz
 
 # Model checkpoints
 checkpoints/*
 *.pt
 *.pth
 *.ckpt
+# Checkpoints & Model Weights
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.ckpt
+checkpoints/*.bin
+checkpoints/*.safetensors
+!checkpoints/.gitkeep
 
 # Experiment outputs
+# Results & Outputs
 results/logs/*
 results/reconstructions/*
 results/*.csv
+results/figures/*
+results/tables/*
+!results/logs/.gitkeep
+!results/reconstructions/.gitkeep
+!results/figures/.gitkeep
+!results/tables/.gitkeep
 
 # Kaggle
+# Paper build outputs
+paper/figures/*
+paper/tables/*
+paper/manuscript/*.pdf
+paper/manuscript/*.aux
+paper/manuscript/*.log
+!paper/figures/.gitkeep
+!paper/tables/.gitkeep
+!paper/manuscript/.gitkeep
+
+# Kaggle / Environment
 /kaggle/
+.kaggle/
+kaggle.json
+.env
+*.env
 
 # OS
+# OS / IDE
 .DS_Store
 
 # IDE
 .vscode/
 .idea/
+*.swp

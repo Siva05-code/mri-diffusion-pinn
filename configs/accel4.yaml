@@ -1,0 +1,6 @@
+# 4x Acceleration Configuration
+experiment:
+  acceleration: 4
+  center_fractions: [0.08]
+  accelerations: [4]
+
