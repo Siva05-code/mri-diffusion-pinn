@@ -8,6 +8,8 @@ differentiable Tweedie clean image estimation (x0 prediction), and DDPM reverse 
 from typing import Optional
 import torch
 
+from src.physics.fft import image_to_kspace_torch, kspace_to_image_torch
+
 
 class DiffusionSchedule:
     """
@@ -101,6 +103,9 @@ class DiffusionSchedule:
         self,
         model: torch.nn.Module,
         condition: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        k_measured: Optional[torch.Tensor] = None,
+        measurement_guided: bool = True,
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """
@@ -109,14 +114,43 @@ class DiffusionSchedule:
         where:
             mu_theta = 1 / sqrt(alpha_t) * (x_t - (beta_t / sqrt(1 - alpha_bar_t)) * predicted_noise)
             x_{t-1} = mu_theta + sqrt(beta_t) * z  (for t > 0)
+        Measurement-guided reverse diffusion sampling for accelerated MRI reconstruction:
+
+        At each reverse diffusion timestep t (from T-1 down to 0):
+        1. Conditional diffusion model predicts injected noise:
+               epsilon_hat = model(x_t, condition, mask, t)
+        2. Analytical clean image estimation via Tweedie's formula:
+               x0_pred = clamp((x_t - sqrt(1 - alpha_bar_t) * epsilon_hat) / sqrt(alpha_bar_t), 0, 1)
+        3. Common 320x320 reconstruction-domain Fourier consistency:
+           Enforces consistency with the Fourier representation of the zero-filled input condition
+           (or explicitly supplied measurement reference) at sampled mask trajectories:
+               k_pred = FFT(x0_pred)
+               k_ref = k_measured if k_measured is not None else FFT(condition)
+               k_guided = M * k_ref + (1 - M) * k_pred
+               x0_guided = clamp(|IFFT(k_guided)|, 0, 1)
+        4. Measurement-guided DDPM reverse update:
+           Computes the reverse posterior mean mu_t guided by x0_guided:
+               mu_t = (sqrt(alpha_bar_{t-1}) * beta_t / (1 - alpha_bar_t)) * x0_guided
+                    + (sqrt(alpha_t) * (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t)) * x_t
+               x_{t-1} = mu_t + sqrt(beta_t) * z  (z ~ N(0, I) for t > 0, 0 for t = 0)
+
+        NOTE: This reverse process is explicitly a measurement-guided reverse diffusion step,
+        not standard unconstrained DDPM sampling. It strictly operates in the common 320x320
+        reconstruction domain and never uses ground-truth target information.
 
         Args:
             model: Conditional diffusion U-Net (expects (x_t, condition, t)).
             condition: Zero-filled initial MRI reconstruction condition [B, C, H, W].
+            model: Conditional diffusion U-Net (expects (x_t, condition, mask, t)).
+            condition: Zero-filled initial MRI reconstruction condition [B, 1, H, W].
+            mask: Optional binary sampling mask [B, 1, H, W] or [1, 1, 1, W] (1 for sampled).
+            k_measured: Optional explicit measurement reference in common reconstruction domain.
+            measurement_guided: Whether to enforce common 320x320 Fourier consistency.
             device: Execution device (defaults to condition.device).
 
         Returns:
             torch.Tensor: Reconstructed clean image, clamped to [0, 1] after sampling.
+            torch.Tensor: Reconstructed clean image, clamped to [0, 1].
         """
         if device is None:
             device = condition.device
@@ -140,28 +174,59 @@ class DiffusionSchedule:
             predicted_noise = model(
                 x,
                 condition,
+                mask,
                 t,
             )
 
             alpha = self.alphas[i]
             alpha_bar = self.alpha_bars[i]
+            alpha_bar_prev = self.alpha_bars[i - 1] if i > 0 else torch.tensor(1.0, device=device)
             beta = self.betas[i]
+
+            # 1. Tweedie clean image prediction
+            sqrt_alpha_bar = torch.sqrt(alpha_bar)
+            sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar)
+            pred_x0 = (x - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
+            pred_x0 = torch.clamp(pred_x0, 0.0, 1.0)
+
+            # 2. Common 320x320 reconstruction-domain Fourier consistency
+            if measurement_guided and mask is not None:
+                img_complex = pred_x0.squeeze(1).to(torch.complex64)
+                k_pred = image_to_kspace_torch(img_complex)
+
+                if k_measured is not None:
+                    k_ref = k_measured
+                else:
+                    cond_complex = condition.squeeze(1).to(torch.complex64)
+                    k_ref = image_to_kspace_torch(cond_complex)
+
+                mask_k = mask
+                while mask_k.ndim > 3:
+                    mask_k = mask_k.squeeze(1)
+                if mask_k.shape[-1] > k_pred.shape[-1]:
+                    w_from = (mask_k.shape[-1] - k_pred.shape[-1]) // 2
+                    mask_k = mask_k[..., w_from : w_from + k_pred.shape[-1]]
+                if mask_k.ndim > 2 and mask_k.shape[-2] > k_pred.shape[-2]:
+                    h_from = (mask_k.shape[-2] - k_pred.shape[-2]) // 2
+                    mask_k = mask_k[..., h_from : h_from + k_pred.shape[-2], :]
+                mask_k = mask_k.to(device=device, dtype=k_pred.real.dtype)
+
+                k_guided = mask_k * k_ref + (1.0 - mask_k) * k_pred
+                x_rec = kspace_to_image_torch(k_guided)
+                x0_guided = torch.real(x_rec).unsqueeze(1)
+                x0_guided = torch.clamp(x0_guided, 0.0, 1.0)
+            else:
+                x0_guided = pred_x0
 
             if i > 0:
                 noise = torch.randn_like(x, device=device)
             else:
                 noise = torch.zeros_like(x, device=device)
 
-            # DDPM reverse update step
-            x = (
-                (1.0 / torch.sqrt(alpha))
-                * (
-                    x
-                    - (beta / torch.sqrt(1.0 - alpha_bar))
-                    * predicted_noise
-                )
-                + torch.sqrt(beta) * noise
-            )
+            # 3. Measurement-guided DDPM reverse update step
+            coeff_x0 = (torch.sqrt(alpha_bar_prev) * beta) / (1.0 - alpha_bar)
+            coeff_xt = (torch.sqrt(alpha) * (1.0 - alpha_bar_prev)) / (1.0 - alpha_bar)
 
-        # Clamp output to valid normalized intensity range [0, 1] only after sampling is complete
-        return x.clamp(0.0, 1.0)
+            x = coeff_x0 * x0_guided + coeff_xt * x + torch.sqrt(beta) * noise
+
+        return x0_guided.clamp(0.0, 1.0)

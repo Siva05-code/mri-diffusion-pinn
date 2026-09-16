@@ -93,6 +93,7 @@ def main():
             )
     else:
         # Smoke test mode: allow using validation directory only for pipeline verification
+        # Smoke test mode: allow using validation directory or local simulation for pipeline verification
         if not train_dir or not Path(train_dir).exists():
             if val_dir and Path(val_dir).exists():
                 print(f"[SMOKE TEST] Training directory '{train_dir}' not found.")
@@ -102,6 +103,43 @@ def main():
                 raise FileNotFoundError(
                     f"Neither training directory ('{train_dir}') nor validation directory ('{val_dir}') exists."
                 )
+                print("[SMOKE TEST] FastMRI dataset directories not found locally.")
+                print("[SMOKE TEST] Generating realistic simulated fastMRI knee dataset for pipeline verification.")
+                from src.physics.fft import image_to_kspace_torch
+                from src.data.preprocessing import center_crop
+                import h5py
+                import torch
+                import numpy as np
+
+                smoke_root = Path("data/fastmri/smoke")
+                smoke_train = smoke_root / "train"
+                smoke_val = smoke_root / "val"
+                smoke_train.mkdir(parents=True, exist_ok=True)
+                smoke_val.mkdir(parents=True, exist_ok=True)
+
+                H, W = 640, 368
+                y, x = torch.meshgrid(torch.linspace(-1, 1, H), torch.linspace(-1, 1, W), indexing="ij")
+                knee = (x**2 / 0.6**2 + y**2 / 0.8**2) < 0.8
+                bone = ((x + 0.1)**2 / 0.2**2 + (y + 0.1)**2 / 0.3**2) < 0.5
+                sim_img = torch.zeros(H, W, dtype=torch.float32)
+                sim_img[knee] = 0.6 + 0.3 * torch.cos(8 * x[knee])
+                sim_img[bone] = 0.95
+                phase = 0.5 * torch.sin(3 * x) + 0.2 * torch.cos(2 * y)
+                sim_complex = sim_img.to(torch.complex64) * torch.exp(1j * phase)
+                kspace_np = image_to_kspace_torch(sim_complex).numpy()
+                target_np = center_crop(sim_img, (320, 320)).numpy()
+
+                kspace_batch = np.stack([kspace_np, kspace_np], axis=0)
+                target_batch = np.stack([target_np, target_np], axis=0)
+
+                for folder in [smoke_train, smoke_val]:
+                    fname = folder / "sim_knee_sample.h5"
+                    if not fname.exists():
+                        with h5py.File(fname, "w") as hf:
+                            hf.create_dataset("kspace", data=kspace_batch)
+                            hf.create_dataset("reconstruction_rss", data=target_batch)
+                train_dir = str(smoke_train)
+                val_dir = str(smoke_val)
 
     epochs = args.epochs or train_cfg.get("epochs", 5)
     learning_rate = args.lr or train_cfg.get("learning_rate", 1e-4)

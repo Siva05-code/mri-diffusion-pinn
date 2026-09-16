@@ -158,6 +158,8 @@ class DiffusionPINN(nn.Module):
 
         # 2. Diffusion model predicts noise
         pred_noise = self.diffusion(x_t, condition, t)
+        # 2. Diffusion model predicts noise (receives x_t, condition, mask, t)
+        pred_noise = self.diffusion(x_t, condition, mask, t)
 
         # 3. Differentiable coarse reconstruction
         coarse = self.predict_x0_from_noise(x_t, pred_noise, t)
@@ -213,9 +215,13 @@ class DiffusionPINN(nn.Module):
         self.eval()
 
         # Step 1: Coarse reconstruction via reverse diffusion
+        # Step 1: Coarse reconstruction via measurement-guided reverse diffusion
         coarse = self.schedule.sample(
             model=self.diffusion,
             condition=condition,
+            mask=mask,
+            k_measured=y_measured,
+            measurement_guided=True,
             device=device,
         )
 

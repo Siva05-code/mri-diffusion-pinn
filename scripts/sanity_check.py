@@ -109,6 +109,7 @@ def run_sanity_checks():
     noise = torch.randn_like(target)
     noisy_target = schedule.add_noise(target, noise, t)
     pred_noise = model.diffusion(noisy_target, condition, t)
+    pred_noise = model.diffusion(noisy_target, condition, mask_320, t)
     pred_x0 = schedule.predict_x0(noisy_target, pred_noise, t, clamp=True)
 
     x0_min, x0_max = pred_x0.min().item(), pred_x0.max().item()
@@ -121,6 +122,7 @@ def run_sanity_checks():
     # Check 4: Diffusion reverse sampling reconstruction range
     # -------------------------------------------------------------
     diff_recon = schedule.sample(model=model.diffusion, condition=condition, device=device)
+    diff_recon = schedule.sample(model=model.diffusion, condition=condition, mask=mask_320, device=device)
     diff_min, diff_max = diff_recon.min().item(), diff_recon.max().item()
     diff_pass = (0.0 <= diff_min) and (diff_max <= 1.0)
     print(f"Check 4: Diffusion reconstruction range [{diff_min:.4f}, {diff_max:.4f}] -> [{'PASS' if diff_pass else 'FAIL'}]")

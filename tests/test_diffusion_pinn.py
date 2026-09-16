@@ -216,10 +216,20 @@ def test_diffusion_schedule_x0_and_sampling():
     assert torch.allclose(pred_x0, target, atol=1e-4), "Tweedie formula did not invert noise addition"
 
     # Reverse sampling test
+    # Reverse sampling test with measurement guidance
     from src.models.diffusion import ConditionalDiffusionUNet
     model = ConditionalDiffusionUNet(base_channels=8, time_dim=32)
+    model = ConditionalDiffusionUNet(in_channels=3, base_channels=8, time_dim=32)
     condition = torch.rand(1, 1, 32, 32)
     sample_out = schedule.sample(model=model, condition=condition, device=torch.device("cpu"))
+    mask = torch.ones(1, 1, 32)
+    sample_out = schedule.sample(
+        model=model,
+        condition=condition,
+        mask=mask,
+        measurement_guided=True,
+        device=torch.device("cpu"),
+    )
     assert sample_out.shape == (1, 1, 32, 32)
     assert sample_out.min() >= 0.0 and sample_out.max() <= 1.0, "Sampled output not in [0, 1]"
 
@@ -252,6 +262,139 @@ def test_inference_validation_path():
     assert refined.min() >= 0.0 and refined.max() <= 1.0
 
 
+def test_diffusion_3channel_forward():
+    """Test 11: ConditionalDiffusionUNet accepts 3-channel input [x_t, condition, mask]."""
+    from src.models.diffusion import ConditionalDiffusionUNet
+    model = ConditionalDiffusionUNet(in_channels=3, base_channels=16, time_dim=64)
+    B, H, W = 2, 64, 64
+    x_t = torch.randn(B, 1, H, W)
+    condition = torch.rand(B, 1, H, W)
+    mask = torch.ones(1, 1, W)
+    t = torch.randint(0, 100, (B,), dtype=torch.long)
+
+    pred_noise = model(x_t, condition, mask, t)
+    assert pred_noise.shape == (B, 1, H, W), f"Expected {(B, 1, H, W)}, got {pred_noise.shape}"
+
+
+def test_mask_broadcasting():
+    """Test 12: Mask broadcasting across different dimensions produces identical outputs."""
+    from src.models.diffusion import ConditionalDiffusionUNet
+    model = ConditionalDiffusionUNet(in_channels=3, base_channels=16, time_dim=64)
+    model.eval()
+
+    torch.manual_seed(42)
+    x_t = torch.randn(1, 1, 32, 32)
+    condition = torch.rand(1, 1, 32, 32)
+    t = torch.tensor([10], dtype=torch.long)
+
+    # 1D line mask across columns
+    mask_1d = torch.zeros(1, 32)
+    mask_1d[0, 10:22] = 1.0
+
+    mask_3d = mask_1d.unsqueeze(0)  # [1, 1, 32]
+    mask_4d = mask_1d.unsqueeze(0).unsqueeze(0).expand(1, 1, 32, 32)  # [1, 1, 32, 32]
+
+    with torch.no_grad():
+        out_1d = model(x_t, condition, mask_1d, t)
+        out_3d = model(x_t, condition, mask_3d, t)
+        out_4d = model(x_t, condition, mask_4d, t)
+
+    assert torch.allclose(out_1d, out_3d, atol=1e-6), "1D and 3D mask outputs differ"
+    assert torch.allclose(out_1d, out_4d, atol=1e-6), "1D and 4D mask outputs differ"
+
+
+def test_fft_roundtrip_320():
+    """Test 13: Centered FFT/IFFT roundtrip in 320x320 reconstruction domain."""
+    torch.manual_seed(42)
+    img = torch.randn(1, 320, 320, dtype=torch.complex64)
+    k = image_to_kspace_torch(img)
+    recon = kspace_to_image_torch(k)
+    err = torch.norm(recon - img) / torch.norm(img)
+    assert err < 1e-6, f"FFT roundtrip error too large: {err:.2e}"
+
+
+def test_common_320_fourier_consistency_identity():
+    """Test 14: Common 320x320 reconstruction-domain Fourier consistency identity."""
+    torch.manual_seed(42)
+    # When predicted image matches zero-filled condition, Fourier consistency must return exact identity
+    condition = torch.rand(1, 1, 64, 64)
+    mask = torch.zeros(1, 1, 64)
+    mask[:, :, 20:44] = 1.0
+
+    cond_complex = condition.squeeze(1).to(torch.complex64)
+    k_ref = image_to_kspace_torch(cond_complex)
+
+    k_pred = image_to_kspace_torch(cond_complex)
+    k_guided = mask * k_ref + (1.0 - mask) * k_pred
+    x0_guided = torch.abs(kspace_to_image_torch(k_guided)).unsqueeze(1)
+
+    assert torch.allclose(x0_guided, condition, atol=1e-5), \
+        "Fourier consistency identity violated on identical prediction and condition"
+
+
+def test_measurement_guided_sampling_consistency():
+    """Test 15: Measurement-guided reverse sampling preserves sampled Fourier coefficients."""
+    from src.models.diffusion import ConditionalDiffusionUNet
+    model = ConditionalDiffusionUNet(in_channels=3, base_channels=8, time_dim=32)
+    schedule = DiffusionSchedule(timesteps=5)
+
+    torch.manual_seed(42)
+    condition = torch.rand(1, 1, 32, 32)
+    mask = torch.zeros(1, 1, 32)
+    mask[:, :, 11:22] = 1.0
+
+    recon_guided = schedule.sample(
+        model=model,
+        condition=condition,
+        mask=mask,
+        measurement_guided=True,
+        device=torch.device("cpu"),
+    )
+    recon_unguided = schedule.sample(
+        model=model,
+        condition=condition,
+        mask=mask,
+        measurement_guided=False,
+        device=torch.device("cpu"),
+    )
+
+    k_cond = image_to_kspace_torch(condition.squeeze(1).to(torch.complex64))
+    k_guided = image_to_kspace_torch(recon_guided.squeeze(1).to(torch.complex64))
+    k_unguided = image_to_kspace_torch(recon_unguided.squeeze(1).to(torch.complex64))
+
+    err_guided = torch.norm(mask * (k_guided - k_cond)) / (torch.norm(mask * k_cond) + 1e-12)
+    err_unguided = torch.norm(mask * (k_unguided - k_cond)) / (torch.norm(mask * k_cond) + 1e-12)
+
+    assert err_guided < 0.05, f"Sampled Fourier coefficients diverged: {err_guided:.2e}"
+    assert err_guided < 0.1 * err_unguided, f"Measurement guidance did not reduce error: guided={err_guided:.4f} vs unguided={err_unguided:.4f}"
+
+
+def test_checkpoint_migration_rejection():
+    """Test 16: Checkpoint loader rejects 2-channel weights unless migrate_2ch=True."""
+    from src.models.diffusion import ConditionalDiffusionUNet
+    old_model = ConditionalDiffusionUNet(in_channels=2, base_channels=16, time_dim=32)
+    old_state = old_model.state_dict()
+
+    new_model = ConditionalDiffusionUNet(in_channels=3, base_channels=16, time_dim=32)
+
+    # 1. Loading without migration flag must fail
+    rejected = False
+    try:
+        new_model.load_compatible_state_dict(old_state, migrate_2ch=False)
+    except RuntimeError as e:
+        rejected = True
+        assert "Checkpoint incompatibility" in str(e)
+
+    assert rejected, "Legacy 2-channel checkpoint was silently accepted without migration flag!"
+
+    # 2. Loading with migrate_2ch=True must succeed
+    new_model.load_compatible_state_dict(old_state, migrate_2ch=True)
+    assert new_model.enc1.conv1.weight.shape[1] == 3
+    # Channel 2 must be zero-initialized
+    assert torch.all(new_model.enc1.conv1.weight[:, 2, :, :] == 0.0), \
+        "Migrated mask channel was not initialized with zeros"
+
+
 if __name__ == "__main__":
     print("Running tests manually...")
     test_pinn_forward()
@@ -276,3 +419,16 @@ if __name__ == "__main__":
     test_inference_validation_path()
     print("✓ test_inference_validation_path passed")
     print("\nALL 10 TESTS PASSED SUCCESSFULLY!")
+    test_diffusion_3channel_forward()
+    print("✓ test_diffusion_3channel_forward passed")
+    test_mask_broadcasting()
+    print("✓ test_mask_broadcasting passed")
+    test_fft_roundtrip_320()
+    print("✓ test_fft_roundtrip_320 passed")
+    test_common_320_fourier_consistency_identity()
+    print("✓ test_common_320_fourier_consistency_identity passed")
+    test_measurement_guided_sampling_consistency()
+    print("✓ test_measurement_guided_sampling_consistency passed")
+    test_checkpoint_migration_rejection()
+    print("✓ test_checkpoint_migration_rejection passed")
+    print("\nALL 16 UNIT TESTS PASSED SUCCESSFULLY!")

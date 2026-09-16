@@ -126,7 +126,7 @@ def validate_diffusion_epoch(
                 break
 
             slice_seed = seed + int(sample.get("slice_idx", [i])[0])
-            condition, target, _, _ = prepare_batch(
+            condition, target, mask_320, _ = prepare_batch(
                 sample=sample,
                 mask_func=mask_func,
                 device=device,
@@ -134,10 +134,11 @@ def validate_diffusion_epoch(
                 seed=slice_seed,
             )
 
-            # Real reverse diffusion inference from random noise
+            # Measurement-guided reverse diffusion inference from random Gaussian noise
             recon = schedule.sample(
                 model=model,
                 condition=condition,
+                mask=mask_320,
                 device=device,
             )
 
@@ -260,8 +261,8 @@ def train_diffusion(
             # Add noise to ground-truth target
             noisy_target = schedule.add_noise(target, noise, t)
 
-            # Diffusion model predicts injected noise
-            predicted_noise = model(noisy_target, condition, t)
+            # Diffusion model predicts injected noise (receives noisy_target, condition, mask_320, t)
+            predicted_noise = model(noisy_target, condition, mask_320, t)
 
             # 1. Noise prediction loss (DDPM objective)
             loss_noise = F.mse_loss(predicted_noise, noise)

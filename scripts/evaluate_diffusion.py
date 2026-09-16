@@ -122,17 +122,22 @@ def evaluate_single_slice(
     zf_complex = kspace_to_image_torch(undersampled)
     zf_mag = torch.abs(zf_complex)
     target_mag = torch.abs(target) if torch.is_complex(target) else target
-
     zf_norm, target_norm = align_and_normalize_slice(zf_mag, target_mag)
 
     condition = zf_norm.unsqueeze(0).unsqueeze(0).float().to(device)
     target_tensor = target_norm.unsqueeze(0).unsqueeze(0).float().to(device)
 
-    # Deterministic DDPM reverse diffusion from seeded noise
+    # Prepare aligned mask in common 320x320 reconstruction domain
+    mask_h = mask.shape[-2]
+    mask_320 = center_crop(mask, (mask_h, condition.shape[-1])).to(device)
+
+    # Deterministic measurement-guided reverse diffusion from seeded noise
     with torch.no_grad():
         diffusion_recon = schedule.sample(
             model=model,
             condition=condition,
+            mask=mask_320,
+            measurement_guided=True,
             device=device,
         )
 
@@ -167,6 +172,11 @@ def main():
     parser.add_argument("--slice_idx", type=int, default=18, help="Slice index to evaluate")
     parser.add_argument("--max_samples", type=int, default=10, help="Max slices to evaluate if running on dataset")
     parser.add_argument("--device", type=str, default=None, help="Device ('cuda' or 'cpu')")
+    parser.add_argument(
+        "--migrate_2ch",
+        action="store_true",
+        help="Explicitly migrate legacy 2-channel checkpoint by zero-initializing mask channel.",
+    )
     args = parser.parse_args()
 
     # Set seeds for reproducible evaluation
@@ -209,10 +219,11 @@ def main():
     print(f"Checkpoint      : {ckpt_path or 'Untrained (random initialization for verification)'}")
     print("=" * 65)
 
-    model = ConditionalDiffusionUNet(base_channels=32, time_dim=128).to(device)
+    model = ConditionalDiffusionUNet(in_channels=3, base_channels=32, time_dim=128).to(device)
     if ckpt_path and Path(ckpt_path).exists():
         ckpt = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(ckpt.get("model_state_dict", ckpt))
+        state_dict = ckpt.get("model_state_dict", ckpt)
+        model.load_compatible_state_dict(state_dict, migrate_2ch=args.migrate_2ch)
         print(f"Loaded checkpoint: {ckpt_path}")
     else:
         print("[INFO] Running with model weights as initialized.")
