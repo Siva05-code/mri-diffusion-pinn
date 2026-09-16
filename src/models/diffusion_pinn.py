@@ -92,6 +92,7 @@ class DiffusionPINN(nn.Module):
         """
         alpha_bar = self.schedule.alpha_bars[t].to(x_t.device)
         alpha_bar = alpha_bar[:, None, None, None]
+        return self.schedule.predict_x0(x_t, pred_noise, t, clamp=True)
 
         sqrt_alpha_bar = torch.sqrt(alpha_bar)
         sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar)
@@ -113,10 +114,14 @@ class DiffusionPINN(nn.Module):
 
         Flows gradients back through PINN into the Diffusion network:
         1. Adds noise to target to create x_t.
+        Training-time diffusion denoising path:
+        1. Adds noise to target to create x_t at timestep t.
         2. Diffusion predicts epsilon.
         3. Differentiably computes coarse x_0 estimate via Tweedie's formula.
         4. Passes coarse x_0 and zero-filled condition through PINN refinement.
         5. Optionally applies k-space data consistency.
+
+        Flows gradients back through PINN into the Diffusion network.
 
         Returns:
             Dict containing:
@@ -168,6 +173,7 @@ class DiffusionPINN(nn.Module):
                 mask=mask,
                 return_complex=False,
             )
+            refined = torch.clamp(refined, 0.0, 1.0)
 
         return {
             "coarse": coarse,
@@ -224,6 +230,7 @@ class DiffusionPINN(nn.Module):
                 mask=mask,
                 return_complex=False,
             )
+            refined = torch.clamp(refined, 0.0, 1.0)
 
         return coarse, refined
 
