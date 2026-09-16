@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.models.pinn import PINNRefinementNet
 from src.models.diffusion_pinn import DiffusionPINN
+from src.models.diffusion_schedule import DiffusionSchedule
 from src.physics.data_consistency import apply_data_consistency, DataConsistencyLayer
 from src.physics.fft import image_to_kspace_torch, kspace_to_image_torch
 from src.losses.image_loss import L1ImageLoss
@@ -202,6 +203,55 @@ def test_joint_gradient_backpropagation():
     optimizer.step()
 
 
+def test_diffusion_schedule_x0_and_sampling():
+    """Test 9: DiffusionSchedule Tweedie x0 prediction and DDPM reverse sampling."""
+    schedule = DiffusionSchedule(timesteps=10)
+    target = torch.rand(1, 1, 32, 32)
+    noise = torch.randn_like(target)
+    t = torch.tensor([5])
+
+    noisy = schedule.add_noise(target, noise, t)
+    # Under ground truth noise, Tweedie formula should recover target closely
+    pred_x0 = schedule.predict_x0(noisy, noise, t, clamp=False)
+    assert torch.allclose(pred_x0, target, atol=1e-4), "Tweedie formula did not invert noise addition"
+
+    # Reverse sampling test
+    from src.models.diffusion import ConditionalDiffusionUNet
+    model = ConditionalDiffusionUNet(base_channels=8, time_dim=32)
+    condition = torch.rand(1, 1, 32, 32)
+    sample_out = schedule.sample(model=model, condition=condition, device=torch.device("cpu"))
+    assert sample_out.shape == (1, 1, 32, 32)
+    assert sample_out.min() >= 0.0 and sample_out.max() <= 1.0, "Sampled output not in [0, 1]"
+
+
+def test_inference_validation_path():
+    """Test 10: Validation inference path uses model.sample() without target."""
+    model = DiffusionPINN(
+        diffusion_base_channels=8,
+        diffusion_time_dim=32,
+        pinn_base_channels=8,
+        pinn_num_blocks=2,
+        timesteps=5,
+        enforce_dc=True,
+    )
+    condition = torch.rand(1, 1, 32, 32)
+    k_meas = torch.randn(1, 32, 32, dtype=torch.complex64)
+    mask = torch.ones(1, 1, 32)
+
+    # Real inference path: no target given
+    coarse, refined = model.sample(
+        condition=condition,
+        y_measured=k_meas,
+        mask=mask,
+        device=torch.device("cpu"),
+    )
+
+    assert coarse.shape == (1, 1, 32, 32)
+    assert refined.shape == (1, 1, 32, 32)
+    assert coarse.min() >= 0.0 and coarse.max() <= 1.0
+    assert refined.min() >= 0.0 and refined.max() <= 1.0
+
+
 if __name__ == "__main__":
     print("Running tests manually...")
     test_pinn_forward()
@@ -221,3 +271,8 @@ if __name__ == "__main__":
     test_joint_gradient_backpropagation()
     print("✓ test_joint_gradient_backpropagation passed")
     print("\nALL 8 TESTS PASSED SUCCESSFULLY!")
+    test_diffusion_schedule_x0_and_sampling()
+    print("✓ test_diffusion_schedule_x0_and_sampling passed")
+    test_inference_validation_path()
+    print("✓ test_inference_validation_path passed")
+    print("\nALL 10 TESTS PASSED SUCCESSFULLY!")
