@@ -110,6 +110,7 @@ class TotalReconstructionLoss(nn.Module):
             total = total + self.lambda_physics * physics_loss
 
         return {
+            "loss": total,
             "total_loss": total,
             "image_loss": image_loss,
             "kspace_loss": kspace_loss,

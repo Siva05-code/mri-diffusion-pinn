@@ -145,14 +145,14 @@ def train_epoch(
             with get_autocast(device):
                 pred = model(x)
                 loss_dict = criterion(pred, y)
-                loss = loss_dict["loss"]
+                loss = loss_dict.get("loss", loss_dict.get("total_loss"))
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
             pred = model(x)
             loss_dict = criterion(pred, y)
-            loss = loss_dict["loss"]
+            loss = loss_dict.get("loss", loss_dict.get("total_loss"))
             loss.backward()
             optimizer.step()
 
@@ -183,7 +183,8 @@ def validate_epoch(
 
             pred = model(x)
             loss_dict = criterion(pred, y)
-            running_loss += loss_dict["loss"].item() * x.size(0)
+            val_loss = loss_dict.get("loss", loss_dict.get("total_loss"))
+            running_loss += val_loss.item() * x.size(0)
             count += x.size(0)
 
             y_np = y.squeeze().cpu().numpy()
