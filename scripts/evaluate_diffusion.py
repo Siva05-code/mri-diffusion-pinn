@@ -122,7 +122,6 @@ def evaluate_single_slice(
     zf_complex = kspace_to_image_torch(undersampled)
     zf_mag = torch.abs(zf_complex)
     target_mag = torch.abs(target) if torch.is_complex(target) else target
-    zf_norm, target_norm = align_and_normalize_slice(zf_mag, target_mag)
 
     condition = zf_norm.unsqueeze(0).unsqueeze(0).float().to(device)
     target_tensor = target_norm.unsqueeze(0).unsqueeze(0).float().to(device)
