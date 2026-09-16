@@ -2,6 +2,8 @@
 Image-Domain Reconstruction Loss Functions for MRI.
 
 Provides modular L1 and MSE losses for training image reconstruction models.
+Provides differentiable L1 and MSE losses for training image reconstruction models:
+    L_image = ||I_pred - I_gt||_1
 """
 
 from typing import Optional
@@ -18,8 +20,22 @@ class L1ImageLoss(nn.Module):
     def __init__(self):
         super().__init__()
         self.criterion = nn.L1Loss()
+        self.criterion = nn.L1Loss(reduction="mean")
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute L1 loss between prediction and ground truth.
+        Supports shapes [B, C, H, W], [B, H, W], or [H, W].
+        """
+        # Ensure dimensions match
+        if pred.ndim != target.ndim:
+            if pred.ndim == 4 and target.ndim == 3:
+                target = target.unsqueeze(1)
+            elif pred.ndim == 3 and target.ndim == 4:
+                pred = pred.unsqueeze(1)
+            elif pred.ndim == 4 and target.ndim == 2:
+                target = target.unsqueeze(0).unsqueeze(0)
+
         return self.criterion(pred, target)
 
 
@@ -30,8 +46,17 @@ class MSEImageLoss(nn.Module):
     def __init__(self):
         super().__init__()
         self.criterion = nn.MSELoss()
+        self.criterion = nn.MSELoss(reduction="mean")
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if pred.ndim != target.ndim:
+            if pred.ndim == 4 and target.ndim == 3:
+                target = target.unsqueeze(1)
+            elif pred.ndim == 3 and target.ndim == 4:
+                pred = pred.unsqueeze(1)
+            elif pred.ndim == 4 and target.ndim == 2:
+                target = target.unsqueeze(0).unsqueeze(0)
+
         return self.criterion(pred, target)
 
 
