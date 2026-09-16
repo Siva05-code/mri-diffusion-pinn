@@ -40,6 +40,9 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size (default: 1).")
     parser.add_argument("--timesteps", type=int, default=None, help="Diffusion timesteps (default: 100).")
     parser.add_argument("--subset_files", type=int, default=None, help="Limit number of H5 files used.")
+    parser.add_argument("--lambda_image", type=float, default=None, help="Weight for image L1 loss.")
+    parser.add_argument("--lambda_kspace", type=float, default=None, help="Weight for kspace loss.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility.")
     parser.add_argument(
         "--smoke_test",
         action="store_true",
@@ -61,12 +64,14 @@ def main():
     if accel_yaml.exists():
         accel_cfg = load_yaml(str(accel_yaml))
         cfg.setdefault("experiment", {}).update(accel_cfg.get("experiment", {}))
+        cfg.setdefault("physics", {}).update(accel_cfg.get("physics", {}))
 
     # 3. Resolve hyperparameters
     data_cfg = cfg.get("data", {})
     exp_cfg = cfg.get("experiment", {})
     train_cfg = cfg.get("training", {})
     diff_cfg = cfg.get("diffusion", {})
+    phys_cfg = cfg.get("physics", {})
 
     train_dir = args.train_dir or data_cfg.get("train_dir")
     val_dir = args.val_dir or data_cfg.get("val_dir")
@@ -110,6 +115,11 @@ def main():
         subset_files = 2
 
     # 4. Call existing implementation from src/training/train_diffusion.py
+    lambda_image = args.lambda_image if args.lambda_image is not None else phys_cfg.get("lambda_image", 1.0)
+    lambda_kspace = args.lambda_kspace if args.lambda_kspace is not None else phys_cfg.get("lambda_kspace", 0.1)
+    seed = args.seed if args.seed is not None else exp_cfg.get("seed", 42)
+
+    # 4. Call implementation from src/training/train_diffusion.py
     train_diffusion(
         train_dir=train_dir,
         val_dir=val_dir,
@@ -119,6 +129,9 @@ def main():
         learning_rate=learning_rate,
         timesteps=timesteps,
         subset_files=subset_files,
+        lambda_image=lambda_image,
+        lambda_kspace=lambda_kspace,
+        seed=seed,
         device=device,
     )
 

@@ -45,6 +45,11 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size.")
     parser.add_argument("--subset_files", type=int, default=None, help="Limit number of H5 files used.")
     parser.add_argument("--timesteps", type=int, default=100, help="Diffusion timesteps.")
+    parser.add_argument("--lambda_image", type=float, default=None, help="Weight for image L1 loss.")
+    parser.add_argument("--lambda_kspace", type=float, default=None, help="Weight for kspace loss.")
+    parser.add_argument("--lambda_physics", type=float, default=None, help="Weight for physics loss.")
+    parser.add_argument("--lambda_gradient", type=float, default=None, help="Weight for gradient TV loss.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility.")
     parser.add_argument(
         "--ablation",
         type=str,
@@ -105,11 +110,12 @@ def main():
         learning_rate=learning_rate,
         timesteps=timesteps,
         subset_files=args.subset_files,
-        lambda_image=phys_cfg.get("lambda_image", 1.0),
-        lambda_kspace=phys_cfg.get("lambda_kspace", 1.0),
-        lambda_physics=phys_cfg.get("lambda_physics", 1.0),
-        lambda_gradient=phys_cfg.get("lambda_gradient", 0.1),
+        lambda_image=args.lambda_image if args.lambda_image is not None else phys_cfg.get("lambda_image", 1.0),
+        lambda_kspace=args.lambda_kspace if args.lambda_kspace is not None else phys_cfg.get("lambda_kspace", 0.1),
+        lambda_physics=args.lambda_physics if args.lambda_physics is not None else phys_cfg.get("lambda_physics", 0.1),
+        lambda_gradient=args.lambda_gradient if args.lambda_gradient is not None else phys_cfg.get("lambda_gradient", 0.1),
         ablation=args.ablation,
+        seed=args.seed if args.seed is not None else exp_cfg.get("seed", 42),
         device=device,
     )
 

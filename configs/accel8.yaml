@@ -4,9 +4,12 @@ experiment:
   center_fraction: 0.04
   center_fractions: [0.04]
   accelerations: [8]
+  seed: 42
 
 physics:
   lambda_image: 1.0
   lambda_kspace: 1.0
   lambda_physics: 1.0
+  lambda_kspace: 0.1
+  lambda_physics: 0.1
   lambda_gradient: 0.1

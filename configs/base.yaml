@@ -31,6 +31,8 @@ physics:
   lambda_image: 1.0
   lambda_kspace: 1.0
   lambda_physics: 1.0
+  lambda_kspace: 0.1
+  lambda_physics: 0.1
   lambda_gradient: 0.1
 
 diffusion:
