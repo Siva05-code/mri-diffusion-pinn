@@ -113,6 +113,21 @@ class PINNRefinementNet(nn.Module):
         Returns:
             torch.Tensor: Refined image [B, 1, H, W].
         """
+        while coarse.ndim > 4:
+            coarse = coarse.squeeze(1)
+        if coarse.ndim == 2:
+            coarse = coarse.unsqueeze(0).unsqueeze(0)
+        elif coarse.ndim == 3:
+            coarse = coarse.unsqueeze(1)
+
+        if zero_filled is not None:
+            while zero_filled.ndim > 4:
+                zero_filled = zero_filled.squeeze(1)
+            if zero_filled.ndim == 2:
+                zero_filled = zero_filled.unsqueeze(0).unsqueeze(0)
+            elif zero_filled.ndim == 3:
+                zero_filled = zero_filled.unsqueeze(1)
+
         if self.in_channels == 2:
             if zero_filled is None:
                 # If 2 channels expected but no zf provided, concatenate coarse with itself

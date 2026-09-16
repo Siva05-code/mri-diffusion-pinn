@@ -126,6 +126,20 @@ class DiffusionPINN(nn.Module):
                 - 'noise': Ground truth injected Gaussian noise
                 - 't': Timestep indices
         """
+        # Ensure strictly 4D [B, 1, H, W]
+        while target.ndim > 4:
+            target = target.squeeze(1)
+        while condition.ndim > 4:
+            condition = condition.squeeze(1)
+        if target.ndim == 2:
+            target = target.unsqueeze(0).unsqueeze(0)
+        elif target.ndim == 3:
+            target = target.unsqueeze(1)
+        if condition.ndim == 2:
+            condition = condition.unsqueeze(0).unsqueeze(0)
+        elif condition.ndim == 3:
+            condition = condition.unsqueeze(1)
+
         device = target.device
 
         if t is None:
@@ -180,6 +194,13 @@ class DiffusionPINN(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (coarse, refined)
         """
+        while condition.ndim > 4:
+            condition = condition.squeeze(1)
+        if condition.ndim == 2:
+            condition = condition.unsqueeze(0).unsqueeze(0)
+        elif condition.ndim == 3:
+            condition = condition.unsqueeze(1)
+
         if device is None:
             device = condition.device
 

@@ -133,6 +133,18 @@ class ConditionalDiffusionUNet(nn.Module):
         self.out = nn.Conv2d(base_channels, 1, 1)
 
     def forward(self, x_t, condition, t):
+        while x_t.ndim > 4:
+            x_t = x_t.squeeze(1)
+        while condition.ndim > 4:
+            condition = condition.squeeze(1)
+        if x_t.ndim == 2:
+            x_t = x_t.unsqueeze(0).unsqueeze(0)
+        elif x_t.ndim == 3:
+            x_t = x_t.unsqueeze(1)
+        if condition.ndim == 2:
+            condition = condition.unsqueeze(0).unsqueeze(0)
+        elif condition.ndim == 3:
+            condition = condition.unsqueeze(1)
 
         t_emb = self.time_embedding(t)
 

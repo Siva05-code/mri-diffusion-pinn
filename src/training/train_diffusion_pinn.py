@@ -99,10 +99,16 @@ def prepare_training_batch(
         tgt_list = []
         for b in range(zf_mag.shape[0]):
             z_n, t_n = align_and_normalize_slice(zf_mag[b], tgt_mag[b])
-            zf_list.append(z_n.unsqueeze(0))
-            tgt_list.append(t_n.unsqueeze(0))
+            zf_list.append(z_n)
+            tgt_list.append(t_n)
         zf_out = torch.stack(zf_list, dim=0).unsqueeze(1).float()
         tgt_out = torch.stack(tgt_list, dim=0).unsqueeze(1).float()
+
+    # Guarantee strictly 4D [B, 1, H, W]
+    while zf_out.ndim > 4:
+        zf_out = zf_out.squeeze(1)
+    while tgt_out.ndim > 4:
+        tgt_out = tgt_out.squeeze(1)
 
     return zf_out, tgt_out, undersampled, kspace, mask
 
