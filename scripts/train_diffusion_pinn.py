@@ -74,6 +74,7 @@ def main():
         cfg.setdefault("experiment", {}).update(accel_cfg.get("experiment", {}))
         cfg.setdefault("physics", {}).update(accel_cfg.get("physics", {}))
 
+    exp_cfg = cfg.get("experiment", {})
     data_cfg = cfg.get("data", {})
     train_cfg = cfg.get("training", {})
     phys_cfg = cfg.get("physics", {})
@@ -89,6 +90,7 @@ def main():
                 f"Real training requires official fastMRI files.\n"
                 f"For quick code verification, run with --smoke_test."
             )
+    else:
         if not train_dir or not Path(train_dir).exists():
             if val_dir and Path(val_dir).exists():
                 print(f"[SMOKE TEST] Using validation subset '{val_dir}' for pipeline verification.")

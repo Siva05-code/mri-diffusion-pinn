@@ -143,7 +143,7 @@ def validate_diffusion_epoch(
 
     with torch.no_grad():
         for i, sample in enumerate(val_loader):
-            if max_val_batches is not None and i >= max_val_batches:
+            if max_val_batches is not None and max_val_batches > 0 and i >= max_val_batches:
                 break
 
             slice_seed = seed + int(sample.get("slice_idx", [i])[0])

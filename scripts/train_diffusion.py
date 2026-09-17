@@ -51,6 +51,12 @@ def main():
     parser.add_argument("--train_dir", type=str, default=None, help="Path to training data directory.")
     parser.add_argument("--val_dir", type=str, default=None, help="Path to validation data directory.")
     parser.add_argument("--device", type=str, default=None, help="Execution device ('cuda' or 'cpu').")
+    parser.add_argument(
+        "--max_val_batches",
+        type=int,
+        default=None,
+        help="Maximum number of validation batches. Use -1 for full validation.",
+    )
     args = parser.parse_args()
 
     # 1. Load base configuration
@@ -153,6 +159,7 @@ def main():
     lambda_image = args.lambda_image if args.lambda_image is not None else phys_cfg.get("lambda_image", 1.0)
     lambda_kspace = args.lambda_kspace if args.lambda_kspace is not None else phys_cfg.get("lambda_kspace", 0.1)
     seed = args.seed if args.seed is not None else exp_cfg.get("seed", 42)
+    max_val_batches = args.max_val_batches
 
     # 4. Call implementation from src/training/train_diffusion.py
     train_diffusion(
@@ -167,6 +174,7 @@ def main():
         lambda_image=lambda_image,
         lambda_kspace=lambda_kspace,
         seed=seed,
+        max_val_batches=max_val_batches,
         device=device,
     )
 
