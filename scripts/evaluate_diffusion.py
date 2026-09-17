@@ -195,6 +195,12 @@ def main():
     parser.add_argument("--mask_type", type=str, default="equispaced", choices=["equispaced", "random"])
     parser.add_argument("--seed", type=int, default=42, help="Seed for deterministic evaluation")
     parser.add_argument("--file_path", type=str, default=None, help="Direct path to HDF5 file")
+    parser.add_argument(
+        "--val_dir",
+        type=str,
+        default=None,
+        help="Validation directory containing fastMRI HDF5 files",
+    )
     parser.add_argument("--slice_idx", type=int, default=18, help="Slice index to evaluate")
     parser.add_argument("--max_samples", type=int, default=10, help="Max slices to evaluate if running on dataset")
     parser.add_argument("--device", type=str, default=None, help="Device ('cuda' or 'cpu')")
@@ -213,7 +219,7 @@ def main():
 
     cfg = load_yaml(args.config)
     data_cfg = cfg.get("data", {})
-    val_dir = data_cfg.get("val_dir")
+    val_dir = args.val_dir or data_cfg.get("val_dir")
 
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
