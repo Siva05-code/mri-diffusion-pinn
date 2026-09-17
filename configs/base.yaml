@@ -9,9 +9,9 @@ dataset:
   source: "official_NYU_fastMRI"
 
 data:
-  dataset_root: "/kaggle/working/data/fastmri"
-  train_dir: "/kaggle/working/data/fastmri/knee_singlecoil_train"
-  val_dir: "/kaggle/working/data/fastmri/knee_singlecoil_val"
+  dataset_root: "data/fastmri"
+  train_dir: "data/fastmri/knee_singlecoil_train"
+  val_dir: "data/fastmri/knee_singlecoil_val"
   num_train_files: 30
   num_val_files: 10
   image_size: [320, 320]

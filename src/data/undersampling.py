@@ -84,11 +84,11 @@ class EquispacedMaskFunc:
         mask = np.zeros(num_cols, dtype=np.float32)
         mask[center_start:center_end] = 1.0
 
-        # Deterministic equispaced offset based on seed if provided
         active_seed = seed if seed is not None else self.seed
-        offset = 0 if active_seed is None else (active_seed % acceleration)
+        accel_int = int(round(acceleration))
+        offset = 0 if active_seed is None else (int(active_seed) % accel_int)
 
-        for col in range(offset, num_cols, acceleration):
+        for col in range(offset, num_cols, accel_int):
             mask[col] = 1.0
 
         mask_shape = [1] * (len(shape) - 1) + [num_cols]

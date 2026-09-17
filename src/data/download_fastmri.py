@@ -75,15 +75,26 @@ def get_signed_url(split="val", cli_url=None):
     env_file = Path(".env")
     if env_file.exists():
         try:
+            raw_urls = []
             with open(env_file, "r") as f:
                 for line in f:
                     line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
                         k, v = line.split("=", 1)
                         k = k.strip()
                         v = v.strip().strip("'\"")
                         if k in [secret_key, generic_key] and v:
                             return v
+                    elif line.startswith("http://") or line.startswith("https://"):
+                        raw_urls.append(line)
+            # If line is a direct URL matching the split
+            for u in raw_urls:
+                if f"knee_singlecoil_{split}" in u or "knee" in u:
+                    return u
+            if raw_urls and len(raw_urls) == 1:
+                return raw_urls[0]
         except Exception:
             pass
 
