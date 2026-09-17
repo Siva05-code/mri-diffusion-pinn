@@ -25,7 +25,7 @@ class DiffusionSchedule:
         self,
         timesteps: int = 100,
         beta_start: float = 1e-4,
-        beta_end: float = 0.02,
+        beta_end: float = 0.10,
         device: str = "cpu",
     ):
         self.timesteps = timesteps
