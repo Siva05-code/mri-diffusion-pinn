@@ -41,11 +41,13 @@ def prepare_batch(
     seed: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Prepares a batch for diffusion training:
-    - Undersamples k-space
-    - Creates zero-filled reconstruction
-    - Aligns and normalizes both to [0, 1] at 320x320
-    - Generates 320x320 Fourier domain reference and mask for data fidelity
+    Prepare one MRI sample for diffusion training.
+
+    Returns:
+        zf_out:          normalized 320x320 zero-filled magnitude image
+        tgt_out:         normalized 320x320 target magnitude image
+        mask_320:        320x320 reconstruction-domain sampling mask
+        k_measured_320:  complex 320x320 measured k-space
     """
     kspace = sample["kspace"].to(device)
     raw_target = sample.get("target")
@@ -57,49 +59,103 @@ def prepare_batch(
         else:
             kspace = kspace.to(torch.complex64)
 
-    # 1. Mask and undersample
+    # ---------------------------------------------------------
+    # 1. Generate undersampling mask in the original acquisition
+    #    domain and create the actual measured k-space.
+    # ---------------------------------------------------------
     mask = mask_func(kspace.shape, seed=seed).to(device)
     undersampled = kspace * mask
 
-    # 2. Zero-filled image
+    # ---------------------------------------------------------
+    # 2. Zero-filled complex reconstruction
+    # ---------------------------------------------------------
     zf_complex = kspace_to_image_torch(undersampled)
     zf_mag = torch.abs(zf_complex)
 
+    # ---------------------------------------------------------
     # 3. Target reference
+    # ---------------------------------------------------------
     if raw_target is not None:
         tgt_mag = raw_target.to(device)
+
         if torch.is_complex(tgt_mag):
             tgt_mag = torch.abs(tgt_mag)
     else:
         full_complex = kspace_to_image_torch(kspace)
         tgt_mag = torch.abs(full_complex)
 
-    # 4. Spatial alignment & [0, 1] normalization
+    # ---------------------------------------------------------
+    # 4. Align and normalize image-domain data to 320x320
+    # ---------------------------------------------------------
     if zf_mag.ndim == 2:
-        zf_norm, tgt_norm = align_and_normalize_slice(zf_mag, tgt_mag)
+        zf_norm, tgt_norm = align_and_normalize_slice(
+            zf_mag,
+            tgt_mag,
+        )
+
         zf_out = zf_norm.unsqueeze(0).unsqueeze(0).float()
         tgt_out = tgt_norm.unsqueeze(0).unsqueeze(0).float()
+
     else:
         zf_list, tgt_list = [], []
+
         for b in range(zf_mag.shape[0]):
-            z_n, t_n = align_and_normalize_slice(zf_mag[b], tgt_mag[b])
+            z_n, t_n = align_and_normalize_slice(
+                zf_mag[b],
+                tgt_mag[b],
+            )
+
             zf_list.append(z_n)
             tgt_list.append(t_n)
+
         zf_out = torch.stack(zf_list, dim=0).unsqueeze(1).float()
         tgt_out = torch.stack(tgt_list, dim=0).unsqueeze(1).float()
 
     while zf_out.ndim > 4:
         zf_out = zf_out.squeeze(1)
+
     while tgt_out.ndim > 4:
         tgt_out = tgt_out.squeeze(1)
 
-    # 5. Mathematically valid common 320x320 Fourier domain reference
-    k_tgt_320 = image_to_kspace_torch(tgt_out.squeeze(1).to(torch.complex64))
-    mask_h = mask.shape[-2]
-    mask_320 = center_crop(mask, (mask_h, tgt_out.shape[-1]))
-    mask_320 = mask_320.to(k_tgt_320.device, dtype=k_tgt_320.real.dtype)
+    # ---------------------------------------------------------
+    # 5. Create a physically consistent 320x320 measured
+    #    k-space representation.
+    #
+    #    IMPORTANT:
+    #    Keep the complex zero-filled image before taking
+    #    magnitude. Crop the complex image to the same FOV,
+    #    then FFT it.
+    # ---------------------------------------------------------
+    zf_complex_320 = center_crop(
+        zf_complex,
+        (tgt_out.shape[-2], tgt_out.shape[-1]),
+    )
 
-    return zf_out, tgt_out, mask_320, k_tgt_320
+    k_measured_320 = image_to_kspace_torch(
+        zf_complex_320.to(torch.complex64)
+    )
+
+    # ---------------------------------------------------------
+    # 6. Build a 320x320 reconstruction-domain mask.
+    #
+    #    The mask is represented on the same grid as
+    #    k_measured_320 and k_tgt_320.
+    # ---------------------------------------------------------
+    mask_320 = center_crop(
+        mask,
+        (tgt_out.shape[-2], tgt_out.shape[-1]),
+    )
+
+    # Convert possible [1, 1, H, W] form to [H, W]
+    while mask_320.ndim > 2:
+        mask_320 = mask_320.squeeze(0)
+
+    mask_320 = mask_320.to(
+        device=k_measured_320.device,
+        dtype=k_measured_320.real.dtype,
+    )
+
+    return zf_out, tgt_out, mask_320, k_measured_320
 
 
 def validate_diffusion_epoch(
