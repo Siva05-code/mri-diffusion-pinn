@@ -66,14 +66,17 @@ def run_tests():
     zf_norm, target_norm = align_and_normalize_slice(zf_raw, target_320)
     assert zf_norm.shape == (320, 320), f"Expected zf (320, 320), got {zf_norm.shape}"
     assert target_norm.shape == (320, 320), f"Expected target (320, 320), got {target_norm.shape}"
-    assert 0.0 <= zf_norm.min() and zf_norm.max() <= 1.0, "zf normalization outside [0, 1]"
-    assert 0.0 <= target_norm.min() and target_norm.max() <= 1.0, "target normalization outside [0, 1]"
+    assert 0.0 <= zf_norm.min() and zf_norm.max() <= 1.5, "zf normalization outside valid quantile range"
+    assert 0.0 <= target_norm.min() and target_norm.max() <= 1.5, "target normalization outside valid quantile range"
     print(f"✓ Preprocessing alignment: zf (640, 368) + target (320, 320) -> both {tuple(zf_norm.shape)} passed.")
 
     # 6. Preprocessing alignment: both (640, 368) full IFFT -> center crop to (320, 320)
     target_raw = torch.rand(640, 368)
     zf_norm2, target_norm2 = align_and_normalize_slice(zf_raw, target_raw, crop_size=(320, 320))
-    assert zf_norm2.shape == (320, 320) and target_norm2.shape == (320, 320)
+    assert zf_norm2.shape == (320, 320), f"Expected zf (320, 320), got {zf_norm2.shape}"
+    assert target_norm2.shape == (320, 320), f"Expected target (320, 320), got {target_norm2.shape}"
+    assert 0.0 <= zf_norm2.min() and zf_norm2.max() <= 1.5, "zf normalization outside valid quantile range"
+    assert 0.0 <= target_norm2.min() and target_norm2.max() <= 1.5, "target normalization outside valid quantile range"
     print(f"✓ Preprocessing alignment: both (640, 368) -> both {tuple(zf_norm2.shape)} passed.")
 
     print("\nALL VERIFICATION TESTS PASSED SUCCESSFULLY!\n")
@@ -81,4 +84,3 @@ def run_tests():
 
 if __name__ == "__main__":
     run_tests()
-

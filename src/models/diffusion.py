@@ -72,7 +72,6 @@ class ConditionalDiffusionUNet(nn.Module):
             nn.Linear(time_dim, time_dim),
         )
 
-        self.enc1 = ConvBlock(2, base_channels, time_dim)
         self.enc1 = ConvBlock(in_channels, base_channels, time_dim)
         self.enc2 = ConvBlock(
             base_channels,

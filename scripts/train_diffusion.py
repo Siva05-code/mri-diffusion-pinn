@@ -100,9 +100,6 @@ def main():
                 print(f"[SMOKE TEST] Using validation subset '{val_dir}' strictly for pipeline verification.")
                 train_dir = val_dir
             else:
-                raise FileNotFoundError(
-                    f"Neither training directory ('{train_dir}') nor validation directory ('{val_dir}') exists."
-                )
                 print("[SMOKE TEST] FastMRI dataset directories not found locally.")
                 print("[SMOKE TEST] Generating realistic simulated fastMRI knee dataset for pipeline verification.")
                 from src.physics.fft import image_to_kspace_torch

@@ -104,16 +104,14 @@ class DiffusionSchedule:
         model: torch.nn.Module,
         condition: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        y_raw: Optional[torch.Tensor] = None,
+        mask_raw: Optional[torch.Tensor] = None,
+        phase_zf: Optional[torch.Tensor] = None,
         k_measured: Optional[torch.Tensor] = None,
         measurement_guided: bool = True,
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """
-        DDPM reverse diffusion sampling:
-            p_theta(x_{t-1} | x_t) = N(x_{t-1}; mu_theta(x_t, t), beta_t * I)
-        where:
-            mu_theta = 1 / sqrt(alpha_t) * (x_t - (beta_t / sqrt(1 - alpha_bar_t)) * predicted_noise)
-            x_{t-1} = mu_theta + sqrt(beta_t) * z  (for t > 0)
         Measurement-guided reverse diffusion sampling for accelerated MRI reconstruction:
 
         At each reverse diffusion timestep t (from T-1 down to 0):
@@ -121,37 +119,40 @@ class DiffusionSchedule:
                epsilon_hat = model(x_t, condition, mask, t)
         2. Analytical clean image estimation via Tweedie's formula:
                x0_pred = clamp((x_t - sqrt(1 - alpha_bar_t) * epsilon_hat) / sqrt(alpha_bar_t), 0, 1)
-        3. Common 320x320 reconstruction-domain Fourier consistency:
-           Enforces consistency with the Fourier representation of the zero-filled input condition
-           (or explicitly supplied measurement reference) at sampled mask trajectories:
-               k_pred = FFT(x0_pred)
-               k_ref = k_measured if k_measured is not None else FFT(condition)
-               k_guided = M * k_ref + (1 - M) * k_pred
-               x0_guided = clamp(|IFFT(k_guided)|, 0, 1)
+        3. Measurement consistency:
+           a) Raw acquisition domain consistency (preferred):
+              Uses raw acquired measurements y_raw and raw mask mask_raw via MRIForwardOperator.data_consistency:
+                  k_pred = F_raw(Z(x0_pred * exp(i * phase_zf)))
+                  k_guided = mask_raw * y_raw + (1 - mask_raw) * k_pred
+                  x0_guided = clamp(Re(C(IFFT_raw(k_guided))), 0, 1)
+           b) Reconstruction-domain Fourier consistency (fallback when raw k-space is not supplied):
+                  k_pred = FFT(x0_pred)
+                  k_ref = k_measured if k_measured is not None else FFT(condition)
+                  k_guided = M * k_ref + (1 - M) * k_pred
+                  x0_guided = clamp(Re(IFFT(k_guided)), 0, 1)
         4. Measurement-guided DDPM reverse update:
            Computes the reverse posterior mean mu_t guided by x0_guided:
                mu_t = (sqrt(alpha_bar_{t-1}) * beta_t / (1 - alpha_bar_t)) * x0_guided
                     + (sqrt(alpha_t) * (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t)) * x_t
-               x_{t-1} = mu_t + sqrt(beta_t) * z  (z ~ N(0, I) for t > 0, 0 for t = 0)
-
-        NOTE: This reverse process is explicitly a measurement-guided reverse diffusion step,
-        not standard unconstrained DDPM sampling. It strictly operates in the common 320x320
-        reconstruction domain and never uses ground-truth target information.
+               x_{t-1} = mu_t + sqrt(posterior_variance) * z  (z ~ N(0, I) for t > 0, 0 for t = 0)
 
         Args:
-            model: Conditional diffusion U-Net (expects (x_t, condition, t)).
-            condition: Zero-filled initial MRI reconstruction condition [B, C, H, W].
             model: Conditional diffusion U-Net (expects (x_t, condition, mask, t)).
             condition: Zero-filled initial MRI reconstruction condition [B, 1, H, W].
-            mask: Optional binary sampling mask [B, 1, H, W] or [1, 1, 1, W] (1 for sampled).
-            k_measured: Optional explicit measurement reference in common reconstruction domain.
-            measurement_guided: Whether to enforce common 320x320 Fourier consistency.
+            mask: 2D/4D spatial conditioning mask [B, 1, H, W] for the neural network.
+            y_raw: Optional acquired raw scanner k-space measurements [B, H_raw, W_raw].
+            mask_raw: Optional binary acquisition mask [B, H_raw, W_raw] or [1, W_raw].
+            phase_zf: Optional spatial phase from complex zero-filled reconstruction [B, 1, H, W].
+            k_measured: Optional fallback reconstruction-domain Fourier reference.
+            measurement_guided: Whether to enforce measurement consistency.
             device: Execution device (defaults to condition.device).
 
         Returns:
-            torch.Tensor: Reconstructed clean image, clamped to [0, 1] after sampling.
             torch.Tensor: Reconstructed clean image, clamped to [0, 1].
         """
+        from src.physics.forward_operator import MRIForwardOperator
+        forward_op = MRIForwardOperator()
+
         if device is None:
             device = condition.device
         else:
@@ -189,32 +190,45 @@ class DiffusionSchedule:
             pred_x0 = (x - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
             pred_x0 = torch.clamp(pred_x0, 0.0, 1.0)
 
-            # 2. Common 320x320 reconstruction-domain Fourier consistency
-            if measurement_guided and mask is not None:
-                img_complex = pred_x0.squeeze(1).to(torch.complex64)
-                k_pred = image_to_kspace_torch(img_complex)
+            # 2. Measurement guidance
+            if measurement_guided:
+                if y_raw is not None and mask_raw is not None:
+                    # Primary: Raw acquisition domain data consistency
+                    x0_dc = forward_op.data_consistency(
+                        x_crop=pred_x0.squeeze(1),
+                        y_raw=y_raw.to(device),
+                        mask_raw=mask_raw.to(device),
+                        phase=phase_zf.squeeze(1) if phase_zf is not None else None,
+                        return_complex=False,
+                    )
+                    x0_guided = x0_dc.unsqueeze(1).clamp(0.0, 1.0)
+                elif mask is not None:
+                    # Secondary fallback: common reconstruction-domain Fourier consistency
+                    img_complex = pred_x0.squeeze(1).to(torch.complex64)
+                    k_pred = image_to_kspace_torch(img_complex)
 
-                if k_measured is not None:
-                    k_ref = k_measured
+                    if k_measured is not None:
+                        k_ref = k_measured.to(device)
+                    else:
+                        cond_complex = condition.squeeze(1).to(torch.complex64)
+                        k_ref = image_to_kspace_torch(cond_complex)
+
+                    mask_k = mask
+                    while mask_k.ndim > 3:
+                        mask_k = mask_k.squeeze(1)
+                    if mask_k.shape[-1] > k_pred.shape[-1]:
+                        w_from = (mask_k.shape[-1] - k_pred.shape[-1]) // 2
+                        mask_k = mask_k[..., w_from : w_from + k_pred.shape[-1]]
+                    if mask_k.ndim > 2 and mask_k.shape[-2] > k_pred.shape[-2]:
+                        h_from = (mask_k.shape[-2] - k_pred.shape[-2]) // 2
+                        mask_k = mask_k[..., h_from : h_from + k_pred.shape[-2], :]
+                    mask_k = mask_k.to(device=device, dtype=k_pred.real.dtype)
+
+                    k_guided = mask_k * k_ref + (1.0 - mask_k) * k_pred
+                    x_rec = kspace_to_image_torch(k_guided)
+                    x0_guided = torch.real(x_rec).unsqueeze(1).clamp(0.0, 1.0)
                 else:
-                    cond_complex = condition.squeeze(1).to(torch.complex64)
-                    k_ref = image_to_kspace_torch(cond_complex)
-
-                mask_k = mask
-                while mask_k.ndim > 3:
-                    mask_k = mask_k.squeeze(1)
-                if mask_k.shape[-1] > k_pred.shape[-1]:
-                    w_from = (mask_k.shape[-1] - k_pred.shape[-1]) // 2
-                    mask_k = mask_k[..., w_from : w_from + k_pred.shape[-1]]
-                if mask_k.ndim > 2 and mask_k.shape[-2] > k_pred.shape[-2]:
-                    h_from = (mask_k.shape[-2] - k_pred.shape[-2]) // 2
-                    mask_k = mask_k[..., h_from : h_from + k_pred.shape[-2], :]
-                mask_k = mask_k.to(device=device, dtype=k_pred.real.dtype)
-
-                k_guided = mask_k * k_ref + (1.0 - mask_k) * k_pred
-                x_rec = kspace_to_image_torch(k_guided)
-                x0_guided = torch.real(x_rec).unsqueeze(1)
-                x0_guided = torch.clamp(x0_guided, 0.0, 1.0)
+                    x0_guided = pred_x0
             else:
                 x0_guided = pred_x0
 
@@ -228,8 +242,7 @@ class DiffusionSchedule:
             coeff_xt = (torch.sqrt(alpha) * (1.0 - alpha_bar_prev)) / (1.0 - alpha_bar)
 
             # Correct DDPM posterior variance:
-            # beta_tilde = beta_t * (1 - alpha_bar_{t-1})
-            #              / (1 - alpha_bar_t)
+            # beta_tilde = beta_t * (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t)
             posterior_variance = (
                 beta * (1.0 - alpha_bar_prev)
             ) / (1.0 - alpha_bar)

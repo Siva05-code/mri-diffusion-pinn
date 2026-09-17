@@ -7,9 +7,11 @@ Trains the composite pipeline:
 
 Supervised by the composite physics-guided objective:
     L_total = L_noise + lambda_image * L_image + lambda_kspace * L_kspace + lambda_physics * L_physics
+where k-space loss compares the forward model of the reconstructed image against ACTUAL acquired
+raw measurements y_raw.
 
 Validation uses the real multi-step inference path:
-    model.sample(condition=zf, y_measured=y_meas, mask=mask)
+    model.sample(condition=zf, mask=mask_recon, y_measured=y_raw, mask_raw=mask_raw, phase_zf=phase_zf)
 and computes evaluation metrics for Zero-Filled, Coarse Diffusion, and Refined PINN outputs.
 """
 
@@ -19,7 +21,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -31,27 +33,41 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.data.dataset import FastMRIDataset
-from src.data.preprocessing import align_and_normalize_slice, center_crop
-from src.data.undersampling import RandomMaskFunc
+from src.data.preprocessing import normalize_slice_pair, center_crop
+from src.data.undersampling import (
+    EquispacedMaskFunc,
+    RandomMaskFunc,
+    create_mask_func,
+    get_recon_conditioning_mask,
+)
 from src.evaluation.metrics import calculate_nmse, calculate_psnr, calculate_ssim
 from src.losses.total_loss import TotalReconstructionLoss
 from src.models.diffusion_pinn import DiffusionPINN
-from src.physics.fft import image_to_kspace_torch, kspace_to_image_torch
+from src.physics.fft import kspace_to_image_torch
 
 
 def prepare_training_batch(
     sample: dict,
-    mask_func: RandomMaskFunc,
+    mask_func: Union[EquispacedMaskFunc, RandomMaskFunc],
     device: torch.device,
     acceleration: int,
     seed: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Prepares a batch for joint Diffusion + PINN training:
-    1. Undersamples k-space using mask_func
-    2. Computes zero-filled reconstruction via IFFT
-    3. Center-crops and normalizes both ZF and Target to [0, 1] at 320x320
-    4. Computes matched 320x320 Fourier domain reference and sampled measurements
+    Prepares a batch for joint Diffusion + PINN training using physical raw measurements:
+    1. Generates acquisition mask in raw domain: mask_raw
+    2. Measures raw k-space: y_raw = mask_raw * kspace_full
+    3. Computes zero-filled reconstruction via centered IFFT
+    4. Center-crops and normalizes both ZF and Target to 320x320 using a shared per-slice scale
+    5. Builds spatial conditioning mask for the neural network
+
+    Returns:
+        zf_out:      Normalized zero-filled condition [B, 1, 320, 320]
+        tgt_out:     Normalized target reference [B, 1, 320, 320]
+        mask_recon:  Conditioning mask for diffusion [B, 1, 320, 320]
+        y_raw_norm:  Normalized raw measurements [B, H_raw, W_raw] (complex)
+        mask_raw:    Raw acquisition mask [B, H_raw, W_raw]
+        phase_zf:    Phase map from zero-filled reconstruction [B, 1, 320, 320]
     """
     kspace = sample["kspace"].to(device)
     raw_target = sample.get("target")
@@ -62,67 +78,66 @@ def prepare_training_batch(
         else:
             kspace = kspace.to(torch.complex64)
 
-    # 1. Generate mask & undersample
-    mask = mask_func(kspace.shape, seed=seed).to(device)
-    undersampled = kspace * mask
+    # 1. Generate mask & measure raw k-space
+    mask_raw = mask_func(kspace.shape, seed=seed).to(device)
+    y_raw = kspace * mask_raw
 
     # 2. Zero-filled reconstruction
-    zf_complex = kspace_to_image_torch(undersampled)
-    zf_mag = torch.abs(zf_complex)
+    zf_complex_raw = kspace_to_image_torch(y_raw)
+    zf_complex_crop = center_crop(zf_complex_raw, (320, 320))
+    zf_mag_crop = torch.abs(zf_complex_crop)
+    phase_zf = torch.angle(zf_complex_crop)
 
     # 3. Target reference
     if raw_target is not None:
-        tgt_mag = raw_target.to(device)
-        if torch.is_complex(tgt_mag):
-            tgt_mag = torch.abs(tgt_mag)
+        tgt_tensor = raw_target.to(device)
+        if torch.is_complex(tgt_tensor):
+            tgt_tensor = torch.abs(tgt_tensor)
+        target_crop = center_crop(tgt_tensor, (320, 320))
     else:
         full_complex = kspace_to_image_torch(kspace)
-        tgt_mag = torch.abs(full_complex)
+        target_crop = center_crop(torch.abs(full_complex), (320, 320))
 
-    # 4. Spatial alignment and [0, 1] normalization
-    if zf_mag.ndim == 2:
-        zf_norm, tgt_norm = align_and_normalize_slice(zf_mag, tgt_mag)
+    # 4. Shared per-slice normalization
+    zf_norm, tgt_norm, scale = normalize_slice_pair(zf_mag_crop, target_crop, percentile=99.0)
+    y_raw_norm = y_raw / scale
+
+    # Guarantee 4D tensors [B, 1, 320, 320]
+    if zf_norm.ndim == 2:
         zf_out = zf_norm.unsqueeze(0).unsqueeze(0).float()
         tgt_out = tgt_norm.unsqueeze(0).unsqueeze(0).float()
+        phase_out = phase_zf.unsqueeze(0).unsqueeze(0).float()
+    elif zf_norm.ndim == 3:
+        zf_out = zf_norm.unsqueeze(1).float()
+        tgt_out = tgt_norm.unsqueeze(1).float()
+        phase_out = phase_zf.unsqueeze(1).float()
     else:
-        zf_list = []
-        tgt_list = []
-        for b in range(zf_mag.shape[0]):
-            z_n, t_n = align_and_normalize_slice(zf_mag[b], tgt_mag[b])
-            zf_list.append(z_n)
-            tgt_list.append(t_n)
-        zf_out = torch.stack(zf_list, dim=0).unsqueeze(1).float()
-        tgt_out = torch.stack(tgt_list, dim=0).unsqueeze(1).float()
+        zf_out = zf_norm.float()
+        tgt_out = tgt_norm.float()
+        phase_out = phase_zf.float()
 
-    # Guarantee strictly 4D [B, 1, H, W]
-    while zf_out.ndim > 4:
-        zf_out = zf_out.squeeze(1)
-    while tgt_out.ndim > 4:
-        tgt_out = tgt_out.squeeze(1)
+    # 5. Build conditioning mask aligned with reconstruction domain
+    mask_recon = get_recon_conditioning_mask(mask_raw, recon_size=(320, 320)).to(device)
 
-    # 5. Common 320x320 Fourier domain representation
-    k_tgt_320 = image_to_kspace_torch(tgt_out.squeeze(1).to(torch.complex64))
-    mask_h = mask.shape[-2]
-    mask_320 = center_crop(mask, (mask_h, tgt_out.shape[-1]))
-    mask_320 = mask_320.to(k_tgt_320.device, dtype=k_tgt_320.real.dtype)
-    y_meas_320 = k_tgt_320 * mask_320
+    if mask_raw.shape != y_raw.shape:
+        mask_raw = mask_raw.expand_as(y_raw)
 
-    return zf_out, tgt_out, y_meas_320, k_tgt_320, mask_320
+    return zf_out, tgt_out, mask_recon, y_raw_norm, mask_raw, phase_out
 
 
 def validate_epoch(
     model: DiffusionPINN,
     val_loader: DataLoader,
-    mask_func: RandomMaskFunc,
+    mask_func: Union[EquispacedMaskFunc, RandomMaskFunc],
     criterion: TotalReconstructionLoss,
     device: torch.device,
     acceleration: int,
     seed: int = 42,
-    max_val_batches: int = 10,
+    max_val_batches: Optional[int] = 10,
 ) -> Dict[str, float]:
     """
     Validates model performance on validation slices using the REAL inference path
-    (model.sample) without using ground truth target during reconstruction.
+    (model.sample) with raw-domain measurement guidance and zero ground-truth leakage.
     """
     model.eval()
     val_total_loss = 0.0
@@ -132,11 +147,11 @@ def validate_epoch(
 
     with torch.no_grad():
         for i, sample in enumerate(val_loader):
-            if i >= max_val_batches:
+            if max_val_batches is not None and i >= max_val_batches:
                 break
 
             slice_seed = seed + int(sample.get("slice_idx", [i])[0])
-            zf, target, y_meas, k_full, mask = prepare_training_batch(
+            zf_out, tgt_out, mask_recon, y_raw_norm, mask_raw, phase_zf = prepare_training_batch(
                 sample=sample,
                 mask_func=mask_func,
                 device=device,
@@ -146,53 +161,60 @@ def validate_epoch(
 
             # Real multi-step reverse diffusion + PINN refinement inference path
             coarse, refined = model.sample(
-                condition=zf,
-                y_measured=y_meas,
-                mask=mask,
+                condition=zf_out,
+                mask=mask_recon,
+                y_measured=y_raw_norm,
+                mask_raw=mask_raw,
+                phase_zf=phase_zf,
                 device=device,
             )
 
             loss_dict = criterion(
                 i_pred=refined,
-                i_gt=target,
-                y_measured=y_meas,
-                k_gt=k_full,
-                mask=mask,
+                i_gt=tgt_out,
+                y_measured=y_raw_norm,
+                k_gt=None,
+                mask=mask_raw,
+                phase=phase_zf,
             )
             val_total_loss += loss_dict["total_loss"].item()
 
-            target_np = target[0, 0].cpu().numpy().astype(np.float32)
-            zf_np = zf[0, 0].cpu().numpy().astype(np.float32)
+            target_np = tgt_out[0, 0].cpu().numpy().astype(np.float32)
+            zf_np = zf_out[0, 0].cpu().numpy().astype(np.float32)
             coarse_np = coarse[0, 0].clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
             refined_np = refined[0, 0].clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
 
+            data_range = float(target_np.max() - target_np.min() + 1e-12)
+
             # Metrics for Zero-Filled
-            zf_psnrs.append(calculate_psnr(target_np, zf_np))
-            zf_ssims.append(calculate_ssim(target_np, zf_np))
+            zf_psnrs.append(calculate_psnr(target_np, zf_np, data_range=data_range))
+            zf_ssims.append(calculate_ssim(target_np, zf_np, data_range=data_range))
             zf_nmses.append(calculate_nmse(target_np, zf_np))
 
             # Metrics for Coarse Diffusion
-            diff_psnrs.append(calculate_psnr(target_np, coarse_np))
-            diff_ssims.append(calculate_ssim(target_np, coarse_np))
+            diff_psnrs.append(calculate_psnr(target_np, coarse_np, data_range=data_range))
+            diff_ssims.append(calculate_ssim(target_np, coarse_np, data_range=data_range))
             diff_nmses.append(calculate_nmse(target_np, coarse_np))
 
             # Metrics for Refined Diffusion+PINN
-            pinn_psnrs.append(calculate_psnr(target_np, refined_np))
-            pinn_ssims.append(calculate_ssim(target_np, refined_np))
+            pinn_psnrs.append(calculate_psnr(target_np, refined_np, data_range=data_range))
+            pinn_ssims.append(calculate_ssim(target_np, refined_np, data_range=data_range))
             pinn_nmses.append(calculate_nmse(target_np, refined_np))
 
-    num_samples = max(len(pinn_psnrs), 1)
+    n = max(len(pinn_psnrs), 1)
     return {
-        "val_total_loss": val_total_loss / num_samples,
-        "val_psnr": float(np.mean(pinn_psnrs)) if pinn_psnrs else 0.0,
-        "val_ssim": float(np.mean(pinn_ssims)) if pinn_ssims else 0.0,
-        "val_nmse": float(np.mean(pinn_nmses)) if pinn_nmses else 0.0,
-        "val_coarse_psnr": float(np.mean(diff_psnrs)) if diff_psnrs else 0.0,
-        "val_coarse_ssim": float(np.mean(diff_ssims)) if diff_ssims else 0.0,
-        "val_coarse_nmse": float(np.mean(diff_nmses)) if diff_nmses else 0.0,
-        "val_zf_psnr": float(np.mean(zf_psnrs)) if zf_psnrs else 0.0,
-        "val_zf_ssim": float(np.mean(zf_ssims)) if zf_ssims else 0.0,
-        "val_zf_nmse": float(np.mean(zf_nmses)) if zf_nmses else 0.0,
+        "val_total_loss": val_total_loss / n,
+        "zf_psnr": float(np.mean(zf_psnrs)),
+        "zf_ssim": float(np.mean(zf_ssims)),
+        "zf_nmse": float(np.mean(zf_nmses)),
+        "diff_psnr": float(np.mean(diff_psnrs)),
+        "diff_ssim": float(np.mean(diff_ssims)),
+        "diff_nmse": float(np.mean(diff_nmses)),
+        "pinn_psnr": float(np.mean(pinn_psnrs)),
+        "pinn_psnr_std": float(np.std(pinn_psnrs)),
+        "pinn_ssim": float(np.mean(pinn_ssims)),
+        "pinn_ssim_std": float(np.std(pinn_ssims)),
+        "pinn_nmse": float(np.mean(pinn_nmses)),
     }
 
 
@@ -200,23 +222,25 @@ def train_diffusion_pinn(
     train_dir: str,
     val_dir: str,
     acceleration: int = 4,
+    center_fraction: Optional[float] = None,
+    mask_type: str = "equispaced",
     epochs: int = 5,
     batch_size: int = 1,
     learning_rate: float = 1e-4,
     timesteps: int = 100,
     subset_files: Optional[int] = 20,
+    ablation: str = "full",
     lambda_image: float = 1.0,
     lambda_kspace: float = 0.1,
     lambda_physics: float = 0.1,
     lambda_gradient: float = 0.1,
     enforce_dc: bool = True,
-    ablation: str = "full",
     seed: int = 42,
-    max_val_batches: int = 10,
+    max_val_batches: Optional[int] = 10,
     device: str = "cuda",
 ) -> Dict[str, any]:
     """
-    Joint training function for Diffusion + PINN.
+    Main training routine for joint Diffusion + PINN MRI reconstruction framework.
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -227,10 +251,14 @@ def train_diffusion_pinn(
         device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
     )
 
-    # Configure ablation weights
+    if center_fraction is None:
+        center_fraction = 0.08 if acceleration == 4 else 0.04
+
+    # Configure ablation parameters
+    ablation = ablation.lower()
+    enable_pinn = True
     if ablation == "diffusion_only":
         enable_pinn = False
-        lambda_kspace = 0.0
         lambda_physics = 0.0
     elif ablation == "diffusion_kspace":
         enable_pinn = False
@@ -242,13 +270,13 @@ def train_diffusion_pinn(
         enable_pinn = True
         lambda_kspace = 0.0
         lambda_physics = 0.0
-    else:  # 'full'
-        enable_pinn = True
 
     print("=" * 65)
     print("PHYSICS-INFORMED DIFFUSION-PINN MRI RECONSTRUCTION")
     print("=" * 65)
     print(f"Acceleration    : {acceleration}x")
+    print(f"Center Fraction : {center_fraction}")
+    print(f"Mask Protocol   : {mask_type.capitalize()} Cartesian")
     print(f"Epochs          : {epochs}")
     print(f"Batch Size      : {batch_size}")
     print(f"Learning Rate   : {learning_rate}")
@@ -280,9 +308,12 @@ def train_diffusion_pinn(
     )
 
     # 2. Mask generators
-    center_frac = 0.08 if acceleration == 4 else 0.04
-    train_mask_func = RandomMaskFunc(center_fractions=[center_frac], accelerations=[acceleration], seed=seed)
-    val_mask_func = RandomMaskFunc(center_fractions=[center_frac], accelerations=[acceleration], seed=seed + 9999)
+    mask_func = create_mask_func(
+        mask_type=mask_type,
+        center_fraction=center_fraction,
+        acceleration=acceleration,
+        seed=seed,
+    )
 
     # 3. Model
     model = DiffusionPINN(
@@ -327,9 +358,9 @@ def train_diffusion_pinn(
 
         for step, sample in enumerate(train_loader):
             batch_seed = seed + epoch * 10000 + step
-            zf, target, y_meas, k_full, mask = prepare_training_batch(
+            zf, target, mask_recon, y_raw_norm, mask_raw, phase_zf = prepare_training_batch(
                 sample=sample,
-                mask_func=train_mask_func,
+                mask_func=mask_func,
                 device=torch_device,
                 acceleration=acceleration,
                 seed=batch_seed,
@@ -339,8 +370,10 @@ def train_diffusion_pinn(
             out = model.forward_train(
                 target=target,
                 condition=zf,
-                y_measured=y_meas,
-                mask=mask,
+                mask=mask_recon,
+                mask_raw=mask_raw,
+                y_measured=y_raw_norm,
+                phase=phase_zf,
             )
 
             # If PINN disabled in ablation, evaluate loss on coarse image; else on refined image
@@ -350,38 +383,39 @@ def train_diffusion_pinn(
             loss_dict = criterion(
                 i_pred=output_image,
                 i_gt=target,
-                y_measured=y_meas,
-                k_gt=k_full,
-                mask=mask,
+                y_measured=y_raw_norm,
+                k_gt=None,
+                mask=mask_raw,
+                phase=phase_zf,
             )
 
-            # Add diffusion epsilon matching loss
-            noise_loss = torch.mean((out["pred_noise"] - out["noise"]) ** 2)
-            total_loss = loss_dict["total_loss"] + noise_loss
+            # Diffusion noise MSE loss
+            noise_loss = torch.nn.functional.mse_loss(out["pred_noise"], out["noise"])
+            total_step_loss = loss_dict["total_loss"] + noise_loss
 
             optimizer.zero_grad()
-            total_loss.backward()
+            total_step_loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
-            train_total_loss_accum += total_loss.item()
+            train_total_loss_accum += total_step_loss.item()
             train_noise_loss_accum += noise_loss.item()
             train_img_loss_accum += loss_dict["image_loss"].item()
             train_ksp_loss_accum += loss_dict["kspace_loss"].item()
             train_phys_loss_accum += loss_dict["physics_loss"].item()
 
-        num_train_batches = max(len(train_loader), 1)
-        avg_train_total = train_total_loss_accum / num_train_batches
-        avg_train_noise = train_noise_loss_accum / num_train_batches
-        avg_train_img = train_img_loss_accum / num_train_batches
-        avg_train_ksp = train_ksp_loss_accum / num_train_batches
-        avg_train_phys = train_phys_loss_accum / num_train_batches
+        n_batches = max(len(train_loader), 1)
+        avg_train_loss = train_total_loss_accum / n_batches
+        avg_noise_loss = train_noise_loss_accum / n_batches
+        avg_img_loss = train_img_loss_accum / n_batches
+        avg_ksp_loss = train_ksp_loss_accum / n_batches
+        avg_phys_loss = train_phys_loss_accum / n_batches
 
-        # Validation using REAL inference path
-        val_metrics = validate_epoch(
+        # Real validation on multi-step inference path
+        val_results = validate_epoch(
             model=model,
             val_loader=val_loader,
-            mask_func=val_mask_func,
+            mask_func=mask_func,
             criterion=criterion,
             device=torch_device,
             acceleration=acceleration,
@@ -389,40 +423,33 @@ def train_diffusion_pinn(
             max_val_batches=max_val_batches,
         )
 
-        epoch_duration = time.time() - epoch_start
-        val_psnr = val_metrics["val_psnr"]
-        val_ssim = val_metrics["val_ssim"]
-        val_nmse = val_metrics["val_nmse"]
-
+        epoch_time = time.time() - epoch_start
         print(
             f"Epoch [{epoch:02d}/{epochs}] "
-            f"Loss: {avg_train_total:.4f} (Noise: {avg_train_noise:.4f}, Img: {avg_train_img:.4f}, "
-            f"Ksp: {avg_train_ksp:.4f}, Phys: {avg_train_phys:.4f}) | "
-            f"Val Loss: {val_metrics['val_total_loss']:.4f} | "
-            f"Val PSNR: {val_psnr:.2f} dB (Coarse: {val_metrics['val_coarse_psnr']:.2f}, ZF: {val_metrics['val_zf_psnr']:.2f}) | "
-            f"Val SSIM: {val_ssim:.4f} | "
-            f"{epoch_duration:.1f}s"
+            f"Loss: {avg_train_loss:.4f} (Noise: {avg_noise_loss:.4f}, Img: {avg_img_loss:.4f}, Ksp: {avg_ksp_loss:.4f}) | "
+            f"Val PSNR: ZF={val_results['zf_psnr']:.2f}, Diff={val_results['diff_psnr']:.2f}, PINN={val_results['pinn_psnr']:.2f} dB | "
+            f"{epoch_time:.1f}s"
         )
 
         record = {
             "epoch": epoch,
-            "train_total_loss": avg_train_total,
-            "train_noise_loss": avg_train_noise,
-            "train_image_loss": avg_train_img,
-            "train_kspace_loss": avg_train_ksp,
-            "train_physics_loss": avg_train_phys,
-            "validation_total_loss": val_metrics["val_total_loss"],
-            "validation_PSNR": val_psnr,
-            "validation_SSIM": val_ssim,
-            "validation_NMSE": val_nmse,
-            "validation_coarse_PSNR": val_metrics["val_coarse_psnr"],
-            "validation_ZF_PSNR": val_metrics["val_zf_psnr"],
-            "epoch_time": epoch_duration,
+            "train_loss": avg_train_loss,
+            "noise_loss": avg_noise_loss,
+            "image_loss": avg_img_loss,
+            "kspace_loss": avg_ksp_loss,
+            "physics_loss": avg_phys_loss,
+            "val_loss": val_results["val_total_loss"],
+            "zf_psnr": val_results["zf_psnr"],
+            "diff_psnr": val_results["diff_psnr"],
+            "pinn_psnr": val_results["pinn_psnr"],
+            "pinn_ssim": val_results["pinn_ssim"],
+            "pinn_nmse": val_results["pinn_nmse"],
+            "epoch_time": epoch_time,
         }
         history.append(record)
 
         # Save latest checkpoint
-        latest_ckpt = checkpoints_dir / f"diffusion_pinn_accel{acceleration}_latest.pt"
+        latest_path = checkpoints_dir / f"diffusion_pinn_{ablation}_accel{acceleration}_latest.pt"
         torch.save(
             {
                 "epoch": epoch,
@@ -430,85 +457,39 @@ def train_diffusion_pinn(
                 "optimizer_state_dict": optimizer.state_dict(),
                 "acceleration": acceleration,
                 "ablation": ablation,
-                "val_psnr": val_psnr,
-                "history": history,
+                "val_psnr": val_results["pinn_psnr"],
             },
-            latest_ckpt,
+            latest_path,
         )
 
-        # Save best checkpoint selected by validation PSNR from the real inference path
-        if val_psnr > best_psnr:
-            best_psnr = val_psnr
-            best_ckpt = checkpoints_dir / f"diffusion_pinn_accel{acceleration}_best.pt"
+        # Save best checkpoint
+        current_psnr = val_results["pinn_psnr"]
+        if current_psnr > best_psnr:
+            best_psnr = current_psnr
+            best_path = checkpoints_dir / f"diffusion_pinn_{ablation}_accel{acceleration}_best.pt"
             torch.save(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
-                    "best_psnr": best_psnr,
-                    "val_ssim": val_ssim,
-                    "val_nmse": val_nmse,
                     "acceleration": acceleration,
                     "ablation": ablation,
+                    "val_psnr": current_psnr,
+                    "val_ssim": val_results["pinn_ssim"],
                 },
-                best_ckpt,
+                best_path,
             )
 
-    # Save log history
-    log_file = logs_dir / f"diffusion_pinn_accel{acceleration}_history.json"
-    with open(log_file, "w") as f:
+    log_path = logs_dir / f"diffusion_pinn_{ablation}_accel{acceleration}_history.json"
+    with open(log_path, "w") as f:
         json.dump(history, f, indent=2)
 
-    print(f"\nTraining completed.")
-    print(f"Latest checkpoint : {latest_ckpt}")
-    print(f"Best checkpoint   : {checkpoints_dir / f'diffusion_pinn_accel{acceleration}_best.pt'} (PSNR: {best_psnr:.2f} dB)")
-    print(f"History saved to  : {log_file}")
-    return {"history": history, "best_psnr": best_psnr}
+    print(f"\nTraining Complete: Best PINN PSNR = {best_psnr:.2f} dB")
+    print(f"Latest checkpoint: {latest_path}")
+    print(f"Log history:       {log_path}")
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Diffusion + PINN MRI Model")
-    parser.add_argument("--config", type=str, default="configs/base.yaml", help="Path to config file")
-    parser.add_argument("--accel", type=int, default=4, help="Acceleration factor (4 or 8)")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--timesteps", type=int, default=100, help="Diffusion timesteps")
-    parser.add_argument("--subset_files", type=int, default=20, help="Subset of training HDF5 files")
-    parser.add_argument(
-        "--ablation",
-        type=str,
-        default="full",
-        choices=["full", "diffusion_only", "diffusion_kspace", "diffusion_physics", "diffusion_pinn_no_physics"],
-        help="Ablation mode",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--device", type=str, default="cuda", help="Target device")
-    args = parser.parse_args()
-
-    # Load base config if present
-    cfg = {}
-    if Path(args.config).exists():
-        with open(args.config, "r") as f:
-            cfg = yaml.safe_load(f) or {}
-
-    train_dir = cfg.get("data", {}).get("train_dir", "/kaggle/working/data/fastmri/knee_singlecoil_train")
-    val_dir = cfg.get("data", {}).get("val_dir", "/kaggle/working/data/fastmri/knee_singlecoil_val")
-    phys_cfg = cfg.get("physics", {})
-
-    train_diffusion_pinn(
-        train_dir=train_dir,
-        val_dir=val_dir,
-        acceleration=args.accel,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.lr,
-        timesteps=args.timesteps,
-        subset_files=args.subset_files,
-        lambda_image=phys_cfg.get("lambda_image", 1.0),
-        lambda_kspace=phys_cfg.get("lambda_kspace", 0.1),
-        lambda_physics=phys_cfg.get("lambda_physics", 0.1),
-        lambda_gradient=phys_cfg.get("lambda_gradient", 0.1),
-        ablation=args.ablation,
-        seed=args.seed,
-        device=args.device,
-    )
+    return {
+        "history": history,
+        "best_psnr": best_psnr,
+        "latest_checkpoint": str(latest_path),
+        "best_checkpoint": str(best_path) if best_psnr > -float("inf") else str(latest_path),
+    }

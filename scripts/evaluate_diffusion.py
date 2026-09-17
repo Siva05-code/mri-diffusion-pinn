@@ -4,16 +4,20 @@ Evaluation Script for Conditional Diffusion MRI Reconstruction Baseline.
 
 Evaluates standalone conditional diffusion on accelerated fastMRI slices:
 - Zero-Filled (baseline)
-- Conditional Diffusion (100-step DDPM reverse sampling from random Gaussian noise)
+- Conditional Diffusion (100-step DDPM reverse sampling with raw-domain measurement guidance)
 
-Supports deterministic reproducible evaluation using --seed.
+Supports deterministic reproducible evaluation using --seed and reports mean ± standard deviation
+over the specified validation population.
 
 Usage:
-    # 1. Single-slice or validation subset evaluation:
+    # 1. Evaluate on validation subset with 4x acceleration:
     python scripts/evaluate_diffusion.py --config configs/base.yaml --accel 4 --seed 42
 
     # 2. Specific checkpoint evaluation:
     python scripts/evaluate_diffusion.py --checkpoint checkpoints/diffusion_accel4_best.pt --accel 4
+
+    # 3. Legacy 2-channel checkpoint migration:
+    python scripts/evaluate_diffusion.py --checkpoint checkpoints/legacy_model.pt --migrate_2ch --accel 4
 """
 
 import argparse
@@ -21,7 +25,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List, Union
 
 import h5py
 import matplotlib.pyplot as plt
@@ -35,8 +39,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.data.dataset import FastMRIDataset
-from src.data.preprocessing import align_and_normalize_slice, center_crop
-from src.data.undersampling import RandomMaskFunc
+from src.data.preprocessing import normalize_slice_pair, center_crop
+from src.data.undersampling import (
+    EquispacedMaskFunc,
+    RandomMaskFunc,
+    create_mask_func,
+    get_recon_conditioning_mask,
+)
 from src.evaluation.metrics import calculate_nmse, calculate_psnr, calculate_ssim
 from src.models.diffusion import ConditionalDiffusionUNet
 from src.models.diffusion_schedule import DiffusionSchedule
@@ -111,31 +120,46 @@ def evaluate_single_slice(
     target: torch.Tensor,
     model: ConditionalDiffusionUNet,
     schedule: DiffusionSchedule,
-    mask_func: RandomMaskFunc,
+    mask_func: Union[EquispacedMaskFunc, RandomMaskFunc],
     device: torch.device,
     seed: int = 42,
 ) -> Dict[str, any]:
-    """Evaluates diffusion reconstruction on a single slice."""
-    mask = mask_func(kspace.shape, seed=seed).to(device)
-    undersampled = kspace * mask
+    """Evaluates diffusion reconstruction on a single slice using the unified physical pipeline."""
+    # 1. Raw mask and physical measurement
+    mask_raw = mask_func(kspace.shape, seed=seed).to(device)
+    y_raw = kspace.to(device) * mask_raw
 
-    zf_complex = kspace_to_image_torch(undersampled)
-    zf_mag = torch.abs(zf_complex)
-    target_mag = torch.abs(target) if torch.is_complex(target) else target
+    # 2. Zero-filled reconstruction via centered IFFT
+    zf_complex_raw = kspace_to_image_torch(y_raw)
+    zf_complex_crop = center_crop(zf_complex_raw, (320, 320))
+    zf_mag_crop = torch.abs(zf_complex_crop)
+    phase_zf = torch.angle(zf_complex_crop)
+
+    # 3. Ground truth target
+    target_crop = center_crop(target.to(device), (320, 320))
+    if torch.is_complex(target_crop):
+        target_crop = torch.abs(target_crop)
+
+    # 4. Shared normalization
+    zf_norm, target_norm, scale = normalize_slice_pair(zf_mag_crop, target_crop, percentile=99.0)
+    y_raw_norm = y_raw / scale
 
     condition = zf_norm.unsqueeze(0).unsqueeze(0).float().to(device)
     target_tensor = target_norm.unsqueeze(0).unsqueeze(0).float().to(device)
+    phase_tensor = phase_zf.unsqueeze(0).unsqueeze(0).float().to(device)
 
-    # Prepare aligned mask in common 320x320 reconstruction domain
-    mask_h = mask.shape[-2]
-    mask_320 = center_crop(mask, (mask_h, condition.shape[-1])).to(device)
+    # 5. Conditioning mask for model
+    mask_recon = get_recon_conditioning_mask(mask_raw, recon_size=(320, 320)).to(device)
 
     # Deterministic measurement-guided reverse diffusion from seeded noise
     with torch.no_grad():
         diffusion_recon = schedule.sample(
             model=model,
             condition=condition,
-            mask=mask_320,
+            mask=mask_recon,
+            y_raw=y_raw_norm,
+            mask_raw=mask_raw,
+            phase_zf=phase_tensor,
             measurement_guided=True,
             device=device,
         )
@@ -144,18 +168,20 @@ def evaluate_single_slice(
     diff_np = diffusion_recon[0, 0].clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
     tgt_np = target_tensor[0, 0].cpu().numpy().astype(np.float32)
 
+    data_range = float(tgt_np.max() - tgt_np.min() + 1e-12)
+
     return {
         "zf_np": zf_np,
         "diff_np": diff_np,
         "target_np": tgt_np,
         "zf_metrics": {
-            "psnr": calculate_psnr(tgt_np, zf_np),
-            "ssim": calculate_ssim(tgt_np, zf_np),
+            "psnr": calculate_psnr(tgt_np, zf_np, data_range=data_range),
+            "ssim": calculate_ssim(tgt_np, zf_np, data_range=data_range),
             "nmse": calculate_nmse(tgt_np, zf_np),
         },
         "diff_metrics": {
-            "psnr": calculate_psnr(tgt_np, diff_np),
-            "ssim": calculate_ssim(tgt_np, diff_np),
+            "psnr": calculate_psnr(tgt_np, diff_np, data_range=data_range),
+            "ssim": calculate_ssim(tgt_np, diff_np, data_range=data_range),
             "nmse": calculate_nmse(tgt_np, diff_np),
         },
     }
@@ -166,6 +192,7 @@ def main():
     parser.add_argument("--config", type=str, default="configs/base.yaml", help="Path to config YAML")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint")
     parser.add_argument("--accel", type=int, default=4, help="Acceleration factor (4 or 8)")
+    parser.add_argument("--mask_type", type=str, default="equispaced", choices=["equispaced", "random"])
     parser.add_argument("--seed", type=int, default=42, help="Seed for deterministic evaluation")
     parser.add_argument("--file_path", type=str, default=None, help="Direct path to HDF5 file")
     parser.add_argument("--slice_idx", type=int, default=18, help="Slice index to evaluate")
@@ -212,124 +239,120 @@ def main():
     print("CONDITIONAL DIFFUSION MRI EVALUATION")
     print("=" * 65)
     print(f"Acceleration    : {accel}x")
+    print(f"Mask Protocol   : {args.mask_type.capitalize()} Cartesian")
     print(f"Seed            : {args.seed} (Deterministic mode enabled)")
     print(f"Timesteps       : {timesteps}")
     print(f"Device          : {device}")
     print(f"Checkpoint      : {ckpt_path or 'Untrained (random initialization for verification)'}")
     print("=" * 65)
 
+    # Initialize model
     model = ConditionalDiffusionUNet(in_channels=3, base_channels=32, time_dim=128).to(device)
     if ckpt_path and Path(ckpt_path).exists():
         ckpt = torch.load(ckpt_path, map_location=device)
-        state_dict = ckpt.get("model_state_dict", ckpt)
+        state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
         model.load_compatible_state_dict(state_dict, migrate_2ch=args.migrate_2ch)
-        print(f"Loaded checkpoint: {ckpt_path}")
+        print(f"[MODEL] Successfully loaded checkpoint weights from: {ckpt_path}")
     else:
-        print("[INFO] Running with model weights as initialized.")
-
+        print("[MODEL] Running with initialized weights (for pipeline verification).")
     model.eval()
+
     schedule = DiffusionSchedule(timesteps=timesteps, device=device)
-    mask_func = RandomMaskFunc(center_fractions=[center_frac], accelerations=[accel], seed=args.seed)
+    mask_func = create_mask_func(
+        mask_type=args.mask_type,
+        center_fraction=center_frac,
+        acceleration=accel,
+        seed=args.seed,
+    )
 
-    results_dir = Path("results")
-    (results_dir / "figures").mkdir(parents=True, exist_ok=True)
-    (results_dir / "tables").mkdir(parents=True, exist_ok=True)
-    (results_dir / "logs").mkdir(parents=True, exist_ok=True)
+    # Multi-slice evaluation if validation directory exists
+    if val_dir and Path(val_dir).exists() and not args.file_path:
+        dataset = FastMRIDataset(val_dir, max_files=args.max_samples)
+        if len(dataset) > 0:
+            print(f"[EVAL] Evaluating across {len(dataset)} validation slices from {val_dir}...")
+            zf_psnrs, zf_ssims, zf_nmses = [], [], []
+            diff_psnrs, diff_ssims, diff_nmses = [], [], []
 
-    # Check if we should evaluate on dataset or single slice
-    if args.file_path or (not val_dir or not Path(val_dir).exists() or len(list(Path(val_dir).glob("*.h5"))) == 0):
-        kspace, target, source_desc = load_or_simulate_slice(args.file_path, args.slice_idx, val_dir)
-        print(f"Evaluating on slice: {source_desc}")
+            for i in range(len(dataset)):
+                sample = dataset[i]
+                slice_seed = args.seed + i
+                res = evaluate_single_slice(
+                    kspace=sample["kspace"],
+                    target=sample.get("target"),
+                    model=model,
+                    schedule=schedule,
+                    mask_func=mask_func,
+                    device=device,
+                    seed=slice_seed,
+                )
+                zf_psnrs.append(res["zf_metrics"]["psnr"])
+                zf_ssims.append(res["zf_metrics"]["ssim"])
+                zf_nmses.append(res["zf_metrics"]["nmse"])
+                diff_psnrs.append(res["diff_metrics"]["psnr"])
+                diff_ssims.append(res["diff_metrics"]["ssim"])
+                diff_nmses.append(res["diff_metrics"]["nmse"])
 
-        eval_res = evaluate_single_slice(
-            kspace=kspace.to(device),
-            target=target.to(device),
-            model=model,
-            schedule=schedule,
-            mask_func=mask_func,
-            device=device,
-            seed=args.seed,
-        )
+            print("\n" + "=" * 65)
+            print(f"POPULATION EVALUATION RESULTS ({len(dataset)} slices)")
+            print("=" * 65)
+            print(f"Zero-Filled Baseline : PSNR: {np.mean(zf_psnrs):.2f} ± {np.std(zf_psnrs):.2f} dB | SSIM: {np.mean(zf_ssims):.4f} ± {np.std(zf_ssims):.4f} | NMSE: {np.mean(zf_nmses):.4f}")
+            print(f"Conditional Diffusion: PSNR: {np.mean(diff_psnrs):.2f} ± {np.std(diff_psnrs):.2f} dB | SSIM: {np.mean(diff_ssims):.4f} ± {np.std(diff_ssims):.4f} | NMSE: {np.mean(diff_nmses):.4f}")
+            print("=" * 65)
+            return
 
-        zf_m = eval_res["zf_metrics"]
-        diff_m = eval_res["diff_metrics"]
+    # Single slice evaluation
+    kspace, target, source_name = load_or_simulate_slice(
+        file_path=args.file_path,
+        slice_idx=args.slice_idx,
+        val_dir=val_dir,
+    )
+    res = evaluate_single_slice(
+        kspace=kspace,
+        target=target,
+        model=model,
+        schedule=schedule,
+        mask_func=mask_func,
+        device=device,
+        seed=args.seed,
+    )
 
-        print("\n" + "=" * 65)
-        print(f"RESULTS FOR {source_desc} ({accel}x Acceleration):")
-        print("=" * 65)
-        print(f"Zero-Filled : PSNR = {zf_m['psnr']:.2f} dB | SSIM = {zf_m['ssim']:.4f} | NMSE = {zf_m['nmse']:.4f}")
-        print(f"Diffusion   : PSNR = {diff_m['psnr']:.2f} dB | SSIM = {diff_m['ssim']:.4f} | NMSE = {diff_m['nmse']:.4f}")
-        print("=" * 65)
+    zf_m = res["zf_metrics"]
+    diff_m = res["diff_metrics"]
+    print("\n" + "=" * 65)
+    print(f"SINGLE SLICE EVALUATION: {source_name}")
+    print("=" * 65)
+    print(f"Zero-Filled Baseline : PSNR: {zf_m['psnr']:.2f} dB | SSIM: {zf_m['ssim']:.4f} | NMSE: {zf_m['nmse']:.4f}")
+    print(f"Conditional Diffusion: PSNR: {diff_m['psnr']:.2f} dB | SSIM: {diff_m['ssim']:.4f} | NMSE: {diff_m['nmse']:.4f}")
+    print("=" * 65)
 
-        # Plot figure
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        axes[0].imshow(eval_res["zf_np"], cmap="gray", vmin=0, vmax=1)
-        axes[0].set_title(f"Zero-Filled ({accel}x)\nPSNR: {zf_m['psnr']:.2f} dB | SSIM: {zf_m['ssim']:.4f}")
-        axes[0].axis("off")
+    # Save visual comparison
+    out_dir = Path("results/figures")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig_path = out_dir / f"diffusion_eval_accel{accel}_slice.png"
 
-        axes[1].imshow(eval_res["diff_np"], cmap="gray", vmin=0, vmax=1)
-        axes[1].set_title(f"Conditional Diffusion\nPSNR: {diff_m['psnr']:.2f} dB | SSIM: {diff_m['ssim']:.4f}")
-        axes[1].axis("off")
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    axes[0].imshow(res["target_np"], cmap="gray")
+    axes[0].set_title("Ground Truth Target")
+    axes[0].axis("off")
 
-        axes[2].imshow(eval_res["target_np"], cmap="gray", vmin=0, vmax=1)
-        axes[2].set_title("Ground Truth Target")
-        axes[2].axis("off")
+    axes[1].imshow(res["zf_np"], cmap="gray")
+    axes[1].set_title(f"Zero-Filled ({zf_m['psnr']:.2f} dB)")
+    axes[1].axis("off")
 
-        plt.tight_layout()
-        fig_path = results_dir / "figures" / f"diffusion_eval_accel{accel}_slice.png"
-        plt.savefig(fig_path, dpi=200, bbox_inches="tight")
-        plt.close()
-        print(f"Saved visualization to: {fig_path}")
+    axes[2].imshow(res["diff_np"], cmap="gray")
+    axes[2].set_title(f"Conditional Diffusion ({diff_m['psnr']:.2f} dB)")
+    axes[2].axis("off")
 
-    else:
-        # Multi-slice validation dataset evaluation
-        dataset = FastMRIDataset(val_dir, max_files=10)
-        n_eval = min(len(dataset), args.max_samples)
-        print(f"Evaluating on {n_eval} validation slices...")
+    err = np.abs(res["diff_np"] - res["target_np"])
+    im = axes[3].imshow(err, cmap="hot")
+    axes[3].set_title("Absolute Error Map")
+    axes[3].axis("off")
+    plt.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
 
-        records = []
-        for idx in range(n_eval):
-            sample = dataset[idx]
-            kspace_t = sample["kspace"].to(device)
-            raw_tgt = sample.get("target")
-            tgt_t = raw_tgt.to(device) if raw_tgt is not None else None
-
-            slice_seed = args.seed + idx
-            eval_res = evaluate_single_slice(
-                kspace=kspace_t,
-                target=tgt_t,
-                model=model,
-                schedule=schedule,
-                mask_func=mask_func,
-                device=device,
-                seed=slice_seed,
-            )
-
-            records.append({
-                "slice": idx,
-                "zf_psnr": eval_res["zf_metrics"]["psnr"],
-                "zf_ssim": eval_res["zf_metrics"]["ssim"],
-                "zf_nmse": eval_res["zf_metrics"]["nmse"],
-                "diff_psnr": eval_res["diff_metrics"]["psnr"],
-                "diff_ssim": eval_res["diff_metrics"]["ssim"],
-                "diff_nmse": eval_res["diff_metrics"]["nmse"],
-            })
-
-        df = pd.DataFrame(records)
-        csv_path = results_dir / "tables" / f"diffusion_eval_accel{accel}.csv"
-        df.to_csv(csv_path, index=False)
-
-        print("\n" + "=" * 65)
-        print(f"DIFFUSION BENCHMARK ({accel}x, N={n_eval} slices, seed={args.seed}):")
-        print("=" * 65)
-        print(f"Zero-Filled: PSNR {df['zf_psnr'].mean():.2f} ± {df['zf_psnr'].std():.2f} dB | "
-              f"SSIM {df['zf_ssim'].mean():.4f} ± {df['zf_ssim'].std():.4f} | "
-              f"NMSE {df['zf_nmse'].mean():.4f} ± {df['zf_nmse'].std():.4f}")
-        print(f"Diffusion  : PSNR {df['diff_psnr'].mean():.2f} ± {df['diff_psnr'].std():.2f} dB | "
-              f"SSIM {df['diff_ssim'].mean():.4f} ± {df['diff_ssim'].std():.4f} | "
-              f"NMSE {df['diff_nmse'].mean():.4f} ± {df['diff_nmse'].std():.4f}")
-        print("=" * 65)
-        print(f"Saved slice metrics to: {csv_path}")
+    plt.tight_layout()
+    plt.savefig(fig_path, dpi=150)
+    plt.close()
+    print(f"[OUTPUT] Saved figure: {fig_path}")
 
 
 if __name__ == "__main__":

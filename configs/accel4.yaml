@@ -4,12 +4,11 @@ experiment:
   center_fraction: 0.08
   center_fractions: [0.08]
   accelerations: [4]
+  mask_type: "equispaced"
   seed: 42
 
 physics:
   lambda_image: 1.0
-  lambda_kspace: 1.0
-  lambda_physics: 1.0
   lambda_kspace: 0.1
   lambda_physics: 0.1
   lambda_gradient: 0.1

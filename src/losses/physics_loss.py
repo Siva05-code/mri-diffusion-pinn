@@ -3,7 +3,7 @@ Physics-Informed MRI Reconstruction Loss.
 
 Combines:
 1. K-space data consistency (fidelity to measured physical k-space):
-   L_data_consistency = || M ⊙ (FFT(I_pred) - y_measured) ||_1 / (|| M ⊙ y_measured ||_1 + eps)
+   L_data_consistency = || M ⊙ (A(I_pred; φ) - y_measured) ||_1 / (|| M ⊙ y_measured ||_1 + eps)
 2. Image-gradient smoothness (physical edge-preserving total variation regularization):
    L_gradient = ||∇_x I_pred||_1 + ||∇_y I_pred||_1
 
@@ -38,6 +38,8 @@ class ImageGradientLoss(nn.Module):
         """
         if img.ndim == 3:
             img = img.unsqueeze(1)
+        elif img.ndim == 2:
+            img = img.unsqueeze(0).unsqueeze(0)
 
         # Finite differences along vertical (y) and horizontal (x) axes
         diff_y = torch.abs(img[:, :, 1:, :] - img[:, :, :-1, :])
@@ -71,16 +73,18 @@ class MRIPhysicsLoss(nn.Module):
     def forward(
         self,
         i_pred: torch.Tensor,
-        y_measured: torch.Tensor,
-        mask: torch.Tensor,
+        y_measured: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        phase: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute physics loss components.
 
         Args:
             i_pred: Predicted image [B, 1, H, W].
-            y_measured: Acquired k-space measurements.
-            mask: Binary sampling mask.
+            y_measured: Optional acquired k-space measurements.
+            mask: Optional binary sampling mask.
+            phase: Optional spatial phase tensor.
 
         Returns:
             Dict containing:
@@ -91,7 +95,7 @@ class MRIPhysicsLoss(nn.Module):
         grad_loss = self.gradient_smoothness(i_pred)
 
         if self.include_data_consistency and y_measured is not None and mask is not None:
-            dc_loss = self.kspace_fidelity(i_pred, y_measured, mask)
+            dc_loss = self.kspace_fidelity(i_pred, y_measured, mask, phase=phase)
             total_physics = dc_loss + self.lambda_gradient * grad_loss
         else:
             dc_loss = torch.tensor(0.0, device=i_pred.device)

@@ -3,13 +3,13 @@
 Diagnostic Script for MRI Fourier Consistency, Loss Scaling, and Physics Verification.
 
 Computes exact quantitative diagnostic metrics:
-A. ||FFT(I_gt) - K_gt|| (Frequency domain reconstruction fidelity)
-B. Measured k-space energy: ||M * K_gt||
-C. Predicted k-space energy: ||FFT(I_pred)||
-D. Zero-filled k-space consistency error: ||M * (FFT(I_zf) - K_gt)||
-E. Data-consistency output k-space error: ||M * (FFT(I_dc) - K_gt)||
-F. Image-domain L1 loss: ||I_pred - I_gt||_1
-G. Normalized k-space loss: ||M * (FFT(I_pred) - K_gt)||_1 / (||M * K_gt||_1 + eps)
+A. Roundtrip FFT/IFFT reconstruction fidelity
+B. Measured k-space energy
+C. Predicted k-space energy
+D. Zero-filled k-space consistency error
+E. Data-consistency output k-space error
+F. Image-domain L1 loss
+G. Relative k-space loss
 
 Prints both RAW and NORMALIZED values across domains.
 """
@@ -28,9 +28,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.physics.fft import kspace_to_image_torch, image_to_kspace_torch
+from src.physics.forward_operator import MRIForwardOperator
 from src.physics.data_consistency import apply_data_consistency
-from src.data.preprocessing import align_and_normalize_slice, center_crop
-from src.data.undersampling import RandomMaskFunc
+from src.data.preprocessing import normalize_slice_pair, center_crop
+from src.data.undersampling import (
+    EquispacedMaskFunc,
+    create_mask_func,
+    get_recon_conditioning_mask,
+)
 from src.models.diffusion_pinn import DiffusionPINN
 from src.losses.total_loss import TotalReconstructionLoss
 
@@ -41,7 +46,6 @@ def load_slice(file_path: str = None, config_path: str = "configs/base.yaml"):
     if file_path and Path(file_path).exists():
         h5_file = Path(file_path)
     else:
-        # Check standard config paths
         if Path(config_path).exists():
             with open(config_path, "r") as f:
                 cfg = yaml.safe_load(f) or {}
@@ -72,7 +76,6 @@ def load_slice(file_path: str = None, config_path: str = "configs/base.yaml"):
             target_t = torch.abs(kspace_to_image_torch(kspace_t))
         source_name = f"Official FastMRI ({h5_file.name}, slice {slice_idx})"
     else:
-        # Standard realistic anatomical knee simulation on [640, 368] grid
         print("[DATA] Official fastMRI file not present locally (available on Kaggle).")
         print("[DATA] Generating realistic fastMRI knee phantom on raw [640, 368] grid.")
         torch.manual_seed(42)
@@ -83,7 +86,6 @@ def load_slice(file_path: str = None, config_path: str = "configs/base.yaml"):
         sim_img = torch.zeros(H, W, dtype=torch.float32)
         sim_img[knee_mask] = 0.6 + 0.3 * torch.cos(8 * x[knee_mask])
         sim_img[bone_mask] = 0.95
-        # Add realistic phase
         phase = 0.5 * torch.sin(3 * x) + 0.2 * torch.cos(2 * y)
         sim_complex = sim_img.to(torch.complex64) * torch.exp(1j * phase)
         kspace_t = image_to_kspace_torch(sim_complex)
@@ -104,25 +106,24 @@ def run_diagnostics(file_path: str = None, config_path: str = "configs/base.yaml
     print(f"Target shape:      {tuple(target_raw.shape)}, dtype: {target_raw.dtype}")
     print("=" * 70)
 
-    # 1. Fourier Reconstruction of full FOV
-    img_full_complex = kspace_to_image_torch(kspace_raw)
-    img_full_mag = torch.abs(img_full_complex)
-
-    # 2. Undersampling (4x, 0.08 center fraction)
-    mask_func = RandomMaskFunc(center_fractions=[0.08], accelerations=[4], seed=42)
+    # 1. Undersampling (4x equispaced)
+    mask_func = create_mask_func(mask_type="equispaced", center_fraction=0.08, acceleration=4, seed=42)
     mask_raw = mask_func(kspace_raw.shape, seed=42)
     kspace_under = kspace_raw * mask_raw
     zf_full_complex = kspace_to_image_torch(kspace_under)
-    zf_full_mag = torch.abs(zf_full_complex)
+    zf_complex_crop = center_crop(zf_full_complex, (320, 320))
+    zf_mag_crop = torch.abs(zf_complex_crop)
+    phase_zf = torch.angle(zf_complex_crop)
 
-    # 3. Standard Alignment & Normalization to 320x320
-    zf_norm, target_norm = align_and_normalize_slice(zf_full_mag, target_raw, crop_size=(320, 320))
+    # 2. Shared Normalization to 320x320
+    target_crop = center_crop(target_raw, (320, 320))
+    zf_norm, target_norm, scale = normalize_slice_pair(zf_mag_crop, target_crop, percentile=99.0)
+    y_raw_norm = kspace_under / scale
 
-    # Calculate normalization scaling factor
-    raw_crop_gt = center_crop(target_raw, (320, 320))
-    scale_factor = (raw_crop_gt.max() - raw_crop_gt.min() + 1e-12).item()
+    # 3. Model Prediction (one pass through Diffusion + PINN)
+    forward_op = MRIForwardOperator()
+    mask_recon = get_recon_conditioning_mask(mask_raw, recon_size=(320, 320))
 
-    # 4. Model Prediction (one pass through Diffusion + PINN)
     model = DiffusionPINN(
         diffusion_base_channels=16,
         diffusion_time_dim=64,
@@ -138,93 +139,57 @@ def run_diagnostics(file_path: str = None, config_path: str = "configs/base.yaml
         out = model.forward_train(
             target=target_input,
             condition=zf_input,
-            y_measured=kspace_under.unsqueeze(0),
-            mask=mask_raw,
+            mask=mask_recon,
+            mask_raw=mask_raw,
+            y_measured=y_raw_norm.unsqueeze(0),
+            phase=phase_zf.unsqueeze(0).unsqueeze(0),
         )
-        pred_img = out["refined"]  # [1, 1, 320, 320] in [0, 1]
+        pred_img = out["refined"]  # [1, 1, 320, 320]
 
-    # Data-consistent prediction in 320x320
-    k_meas_320 = image_to_kspace_torch(zf_norm.to(torch.complex64))
-    mask_320 = center_crop(mask_raw, (1, 320))
-    pred_dc = apply_data_consistency(pred_img, k_meas_320.unsqueeze(0), mask_320, return_complex=False)
+    # Data consistency
+    pred_dc = forward_op.data_consistency(
+        x_crop=pred_img.squeeze(0).squeeze(0),
+        y_raw=y_raw_norm,
+        mask_raw=mask_raw,
+        phase=phase_zf,
+        return_complex=False,
+    )
 
-    # 5. Diagnostic Computations in 320x320 Domain
-    k_gt_320 = image_to_kspace_torch(target_norm.to(torch.complex64))
-    k_pred_320 = image_to_kspace_torch(pred_img.squeeze(0).squeeze(0).to(torch.complex64))
-    k_zf_320 = image_to_kspace_torch(zf_norm.to(torch.complex64))
-    k_dc_320 = image_to_kspace_torch(pred_dc.squeeze(0).squeeze(0).to(torch.complex64))
-
-    # A. ||FFT(I_gt) - K_gt||
-    # In 320x320 domain:
-    err_fft_gt_320 = torch.norm(k_gt_320 - k_gt_320).item()
-    # Between un-normalized full 640x368 image and raw k-space:
+    # Roundtrip FFT/IFFT errors
+    img_full_complex = kspace_to_image_torch(kspace_raw)
     k_full_from_img = image_to_kspace_torch(img_full_complex)
     raw_err_fft_gt = torch.norm(k_full_from_img - kspace_raw).item()
 
-    # B. Measured k-space energy: ||M * K_gt||
     raw_meas_energy = torch.norm(kspace_under).item()
-    norm_meas_energy_320 = torch.norm(mask_320.squeeze(0) * k_gt_320).item()
+    norm_meas_energy = torch.norm(y_raw_norm).item()
 
-    # C. Predicted k-space energy: ||FFT(I_pred)||
-    norm_pred_energy_320 = torch.norm(k_pred_320).item()
+    # Pred k-space
+    k_pred_raw = forward_op.forward_kspace(pred_img.squeeze(), phase=phase_zf, target_shape=kspace_raw.shape)
+    norm_pred_energy = torch.norm(k_pred_raw).item()
 
-    # D. Zero-filled k-space consistency error: ||M * (FFT(I_zf) - K_gt)||
-    raw_zf_dc_err = torch.norm(mask_raw * (image_to_kspace_torch(zf_full_complex) - kspace_under)).item()
-    norm_zf_dc_err_320 = torch.norm(mask_320.squeeze(0) * (k_zf_320 - k_gt_320)).item()
+    # Consistency errors
+    diff_pred = mask_raw * (k_pred_raw - y_raw_norm)
+    dc_err = torch.norm(diff_pred).item() / (norm_meas_energy + 1e-12)
 
-    # E. Data-consistency output k-space error: ||M * (FFT(I_dc) - K_gt)||
-    norm_dc_out_err_320 = torch.norm(mask_320.squeeze(0) * (k_dc_320 - k_gt_320)).item()
+    k_dc = forward_op.forward_kspace(pred_dc, phase=phase_zf, target_shape=kspace_raw.shape)
+    diff_dc = mask_raw * (k_dc - y_raw_norm)
+    post_dc_err = torch.norm(diff_dc).item() / (norm_meas_energy + 1e-12)
 
-    # F. Image-domain L1 loss: ||I_pred - I_gt||_1
     img_l1_loss = torch.mean(torch.abs(pred_img.squeeze() - target_norm)).item()
 
-    # G. K-space loss: raw vs normalized
-    # Raw un-normalized L1 difference at mask positions:
-    k_diff_320 = mask_320.squeeze(0) * (k_pred_320 - k_gt_320)
-    raw_k_l1_diff = torch.mean(torch.abs(k_diff_320)).item()
-    # Relative normalized k-space loss:
-    denom = torch.mean(torch.abs(mask_320.squeeze(0) * k_gt_320)).item() + 1e-12
-    rel_k_loss = raw_k_l1_diff / denom
-
     print("\n--- DIAGNOSTIC VALUES ---")
-    print(f"A. ||FFT(I_gt) - K_gt|| (Roundtrip Error):")
-    print(f"   - Raw 640x368 domain:       {raw_err_fft_gt:.2e}")
-    print(f"   - 320x320 domain:           {err_fft_gt_320:.2e}")
-
-    print(f"\nB. Measured k-space energy ||M * K_gt||_2:")
-    print(f"   - Raw 640x368 domain:       {raw_meas_energy:.4f}")
-    print(f"   - 320x320 domain:           {norm_meas_energy_320:.4f}")
-
-    print(f"\nC. Predicted k-space energy ||FFT(I_pred)||_2:")
-    print(f"   - 320x320 domain:           {norm_pred_energy_320:.4f}")
-
-    print(f"\nD. Zero-filled k-space consistency error ||M * (FFT(I_zf) - K_meas)||_2:")
-    print(f"   - Raw 640x368 domain:       {raw_zf_dc_err:.2e}")
-    print(f"   - 320x320 domain:           {norm_zf_dc_err_320:.2e}")
-
-    print(f"\nE. Data-consistency output k-space error ||M * (FFT(I_dc) - K_meas)||_2:")
-    print(f"   - 320x320 domain:           {norm_dc_out_err_320:.2e}")
-
-    print(f"\nF. Image-domain L1 loss ||I_pred - I_gt||_1:")
-    print(f"   - Image L1 loss:            {img_l1_loss:.6f}")
-
-    print(f"\nG. K-space loss (at mask trajectory):")
-    print(f"   - Raw absolute mean:        {raw_k_l1_diff:.6f}")
-    print(f"   - Relative normalized loss: {rel_k_loss:.6f}")
-
-    print("\n" + "=" * 70)
-    print("SUMMARY COMPARISON:")
-    print(f"  Image L1 Loss           : {img_l1_loss:.6f}")
-    print(f"  Relative K-Space Loss   : {rel_k_loss:.6f}")
-    print(f"  Ratio (K-space / Image) : {rel_k_loss / (img_l1_loss + 1e-12):.2f}x")
+    print(f"A. ||FFT(I_gt) - K_gt|| (Roundtrip Error on 640x368 grid): {raw_err_fft_gt:.2e}")
+    print(f"B. Measured k-space energy (Raw / Normalized):            {raw_meas_energy:.2f} / {norm_meas_energy:.2f}")
+    print(f"C. Predicted k-space energy (Normalized):                 {norm_pred_energy:.2f}")
+    print(f"D. Pre-DC k-space relative error:                         {dc_err:.4f}")
+    print(f"E. Post-DC k-space relative error:                        {post_dc_err:.2e}")
+    print(f"F. Image L1 loss against target:                          {img_l1_loss:.4f}")
     print("=" * 70)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Diagnostic test suite for MRI Fourier consistency and losses")
-    parser.add_argument("--file", type=str, default=None, help="Path to fastMRI H5 file")
+    parser = argparse.ArgumentParser(description="Run diagnostics on MRI physics pipeline")
+    parser.add_argument("--file", type=str, default=None, help="Path to H5 file")
     parser.add_argument("--config", type=str, default="configs/base.yaml", help="Path to config")
     args = parser.parse_args()
-
-    run_diagnostics(file_path=args.file, config_path=args.config)
-
+    run_diagnostics(args.file, args.config)

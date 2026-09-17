@@ -94,12 +94,6 @@ class DiffusionPINN(nn.Module):
         alpha_bar = alpha_bar[:, None, None, None]
         return self.schedule.predict_x0(x_t, pred_noise, t, clamp=True)
 
-        sqrt_alpha_bar = torch.sqrt(alpha_bar)
-        sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar)
-
-        pred_x0 = (x_t - sqrt_one_minus_alpha_bar * pred_noise) / (sqrt_alpha_bar + 1e-8)
-        return torch.clamp(pred_x0, 0.0, 1.0)
-
     def forward_train(
         self,
         target: torch.Tensor,
@@ -108,18 +102,18 @@ class DiffusionPINN(nn.Module):
         noise: Optional[torch.Tensor] = None,
         y_measured: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        mask_raw: Optional[torch.Tensor] = None,
+        phase: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         End-to-end differentiable forward pass for joint training.
 
-        Flows gradients back through PINN into the Diffusion network:
-        1. Adds noise to target to create x_t.
         Training-time diffusion denoising path:
         1. Adds noise to target to create x_t at timestep t.
-        2. Diffusion predicts epsilon.
+        2. Diffusion predicts epsilon given (x_t, condition, mask, t).
         3. Differentiably computes coarse x_0 estimate via Tweedie's formula.
         4. Passes coarse x_0 and zero-filled condition through PINN refinement.
-        5. Optionally applies k-space data consistency.
+        5. Optionally applies k-space data consistency using measured k-space.
 
         Flows gradients back through PINN into the Diffusion network.
 
@@ -156,8 +150,6 @@ class DiffusionPINN(nn.Module):
         # 1. Forward diffusion process
         x_t = self.schedule.add_noise(target, noise, t)
 
-        # 2. Diffusion model predicts noise
-        pred_noise = self.diffusion(x_t, condition, t)
         # 2. Diffusion model predicts noise (receives x_t, condition, mask, t)
         pred_noise = self.diffusion(x_t, condition, mask, t)
 
@@ -168,11 +160,13 @@ class DiffusionPINN(nn.Module):
         refined = self.pinn(coarse=coarse, zero_filled=condition)
 
         # 5. Optional explicit data consistency projection
-        if self.enforce_dc and y_measured is not None and mask is not None:
+        active_mask = mask_raw if mask_raw is not None else mask
+        if self.enforce_dc and y_measured is not None and active_mask is not None:
             refined = apply_data_consistency(
                 x_image=refined,
                 k_measured=y_measured,
-                mask=mask,
+                mask=active_mask,
+                phase=phase,
                 return_complex=False,
             )
             refined = torch.clamp(refined, 0.0, 1.0)
@@ -189,13 +183,15 @@ class DiffusionPINN(nn.Module):
     def sample(
         self,
         condition: torch.Tensor,
-        y_measured: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        y_measured: Optional[torch.Tensor] = None,
+        mask_raw: Optional[torch.Tensor] = None,
+        phase_zf: Optional[torch.Tensor] = None,
         device: Optional[torch.device] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Inference sampling pipeline:
-        1. Full reverse diffusion sampling -> coarse pre-reconstruction
+        1. Full reverse diffusion sampling with measurement guidance -> coarse pre-reconstruction
         2. PINN refinement -> refined reconstruction
         3. Data consistency projection (if enabled)
 
@@ -214,13 +210,14 @@ class DiffusionPINN(nn.Module):
 
         self.eval()
 
-        # Step 1: Coarse reconstruction via reverse diffusion
         # Step 1: Coarse reconstruction via measurement-guided reverse diffusion
         coarse = self.schedule.sample(
             model=self.diffusion,
             condition=condition,
             mask=mask,
-            k_measured=y_measured,
+            y_raw=y_measured,
+            mask_raw=mask_raw,
+            phase_zf=phase_zf,
             measurement_guided=True,
             device=device,
         )
@@ -229,11 +226,13 @@ class DiffusionPINN(nn.Module):
         refined = self.pinn(coarse=coarse, zero_filled=condition)
 
         # Step 3: Enforce data consistency on final image if requested
-        if self.enforce_dc and y_measured is not None and mask is not None:
+        active_mask = mask_raw if mask_raw is not None else mask
+        if self.enforce_dc and y_measured is not None and active_mask is not None:
             refined = apply_data_consistency(
                 x_image=refined,
                 k_measured=y_measured,
-                mask=mask,
+                mask=active_mask,
+                phase=phase_zf,
                 return_complex=False,
             )
             refined = torch.clamp(refined, 0.0, 1.0)
@@ -246,6 +245,8 @@ class DiffusionPINN(nn.Module):
         target: Optional[torch.Tensor] = None,
         y_measured: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        mask_raw: Optional[torch.Tensor] = None,
+        phase: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
         """Unified forward call: calls forward_train if target provided, else sample."""
         if target is not None:
@@ -254,11 +255,15 @@ class DiffusionPINN(nn.Module):
                 condition=condition,
                 y_measured=y_measured,
                 mask=mask,
+                mask_raw=mask_raw,
+                phase=phase,
             )
         else:
             return self.sample(
                 condition=condition,
-                y_measured=y_measured,
                 mask=mask,
+                y_measured=y_measured,
+                mask_raw=mask_raw,
+                phase_zf=phase,
             )
 

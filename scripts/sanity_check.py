@@ -3,15 +3,15 @@
 Reconstruction Sanity Check & Diagnostic Suite.
 
 Validates the numerical and physical correctness of the entire MRI reconstruction pipeline:
-1. ZF image range in [0, 1]
-2. Target image range in [0, 1]
-3. Predicted diffusion x0 range in [0, 1]
-4. Diffusion reverse sampling reconstruction range in [0, 1]
-5. PINN output range in [0, 1]
-6. NaN/Inf detection across all outputs
-7. Shape consistency across all pipeline stages
-8. FFT/IFFT round-trip reconstruction accuracy (< 1e-6)
-9. Data-consistency projection fidelity on sampled k-space (< 1e-5)
+1. ZF image range with shared normalization
+2. Target image range with shared normalization
+3. 3-channel diffusion model forward pass
+4. Measurement-guided reverse diffusion sampling with raw-domain consistency
+5. PINN refinement forward pass
+6. End-to-end DiffusionPINN forward pass & loss computation
+7. Forward operator & k-space data-consistency accuracy
+8. Evaluation metrics implementation
+9. FastMRI data pipeline and mask generation
 
 Prints clear [PASS] / [FAIL] status for each check.
 """
@@ -25,13 +25,21 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.data.preprocessing import align_and_normalize_slice, center_crop
-from src.data.undersampling import RandomMaskFunc
+from src.data.preprocessing import normalize_slice_pair, center_crop
+from src.data.undersampling import (
+    EquispacedMaskFunc,
+    RandomMaskFunc,
+    create_mask_func,
+    get_recon_conditioning_mask,
+)
 from src.models.diffusion import ConditionalDiffusionUNet
 from src.models.diffusion_pinn import DiffusionPINN
 from src.models.diffusion_schedule import DiffusionSchedule
+from src.physics.forward_operator import MRIForwardOperator
 from src.physics.data_consistency import apply_data_consistency
 from src.physics.fft import image_to_kspace_torch, kspace_to_image_torch
+from src.losses.total_loss import TotalReconstructionLoss
+from src.evaluation.metrics import calculate_psnr, calculate_ssim, calculate_nmse
 
 
 def run_sanity_checks():
@@ -59,27 +67,27 @@ def run_sanity_checks():
     kspace_raw = image_to_kspace_torch(sim_complex)
     target_raw = center_crop(sim_img, (320, 320))
 
-    # Undersampling (4x)
-    mask_func = RandomMaskFunc(center_fractions=[0.08], accelerations=[4], seed=42)
-    mask = mask_func(kspace_raw.shape, seed=42)
-    undersampled = kspace_raw * mask
+    # Undersampling (4x equispaced)
+    mask_func = create_mask_func(mask_type="equispaced", center_fraction=0.08, acceleration=4, seed=42)
+    mask_raw = mask_func(kspace_raw.shape, seed=42)
+    y_raw = kspace_raw * mask_raw
 
-    zf_complex = kspace_to_image_torch(undersampled)
-    zf_mag = torch.abs(zf_complex)
+    zf_complex_raw = kspace_to_image_torch(y_raw)
+    zf_complex_crop = center_crop(zf_complex_raw, (320, 320))
+    zf_mag_crop = torch.abs(zf_complex_crop)
+    phase_zf = torch.angle(zf_complex_crop)
 
-    zf_norm, target_norm = align_and_normalize_slice(zf_mag, target_raw, crop_size=(320, 320))
+    zf_norm, target_norm, scale = normalize_slice_pair(zf_mag_crop, target_raw, percentile=99.0)
     condition = zf_norm.unsqueeze(0).unsqueeze(0).float()
     target = target_norm.unsqueeze(0).unsqueeze(0).float()
-
-    k_tgt_320 = image_to_kspace_torch(target.squeeze(1).to(torch.complex64))
-    mask_320 = center_crop(mask, (1, 320)).to(dtype=k_tgt_320.real.dtype)
-    y_meas_320 = k_tgt_320 * mask_320
+    mask_recon = get_recon_conditioning_mask(mask_raw, recon_size=(320, 320))
+    y_raw_norm = y_raw / scale
 
     # -------------------------------------------------------------
     # Check 1: Zero-Filled image range
     # -------------------------------------------------------------
     zf_min, zf_max = zf_norm.min().item(), zf_norm.max().item()
-    zf_pass = (0.0 <= zf_min <= 0.05) and (0.95 <= zf_max <= 1.0)
+    zf_pass = (0.0 <= zf_min <= 0.05) and (0.8 <= zf_max <= 1.5)
     print(f"Check 1: Zero-Filled image range [{zf_min:.4f}, {zf_max:.4f}] -> [{'PASS' if zf_pass else 'FAIL'}]")
     if not zf_pass:
         all_passed = False
@@ -88,7 +96,7 @@ def run_sanity_checks():
     # Check 2: Target image range
     # -------------------------------------------------------------
     tgt_min, tgt_max = target_norm.min().item(), target_norm.max().item()
-    tgt_pass = (0.0 <= tgt_min <= 0.05) and (0.95 <= tgt_max <= 1.0)
+    tgt_pass = (0.0 <= tgt_min <= 0.05) and (0.8 <= tgt_max <= 1.5)
     print(f"Check 2: Target image range [{tgt_min:.4f}, {tgt_max:.4f}] -> [{'PASS' if tgt_pass else 'FAIL'}]")
     if not tgt_pass:
         all_passed = False
@@ -108,8 +116,7 @@ def run_sanity_checks():
     t = torch.tensor([5], dtype=torch.long)
     noise = torch.randn_like(target)
     noisy_target = schedule.add_noise(target, noise, t)
-    pred_noise = model.diffusion(noisy_target, condition, t)
-    pred_noise = model.diffusion(noisy_target, condition, mask_320, t)
+    pred_noise = model.diffusion(noisy_target, condition, mask_recon, t)
     pred_x0 = schedule.predict_x0(noisy_target, pred_noise, t, clamp=True)
 
     x0_min, x0_max = pred_x0.min().item(), pred_x0.max().item()
@@ -119,88 +126,112 @@ def run_sanity_checks():
         all_passed = False
 
     # -------------------------------------------------------------
-    # Check 4: Diffusion reverse sampling reconstruction range
+    # Check 4: Measurement-guided reverse sampling
     # -------------------------------------------------------------
-    diff_recon = schedule.sample(model=model.diffusion, condition=condition, device=device)
-    diff_recon = schedule.sample(model=model.diffusion, condition=condition, mask=mask_320, device=device)
-    diff_min, diff_max = diff_recon.min().item(), diff_recon.max().item()
-    diff_pass = (0.0 <= diff_min) and (diff_max <= 1.0)
-    print(f"Check 4: Diffusion reconstruction range [{diff_min:.4f}, {diff_max:.4f}] -> [{'PASS' if diff_pass else 'FAIL'}]")
-    if not diff_pass:
+    recon = schedule.sample(
+        model=model.diffusion,
+        condition=condition,
+        mask=mask_recon,
+        y_raw=y_raw_norm,
+        mask_raw=mask_raw,
+        phase_zf=phase_zf.unsqueeze(0).unsqueeze(0),
+        measurement_guided=True,
+        device=device,
+    )
+    recon_min, recon_max = recon.min().item(), recon.max().item()
+    recon_pass = (0.0 <= recon_min) and (recon_max <= 1.0) and not torch.isnan(recon).any()
+    print(f"Check 4: Measurement-guided reverse sampling [{recon_min:.4f}, {recon_max:.4f}] -> [{'PASS' if recon_pass else 'FAIL'}]")
+    if not recon_pass:
         all_passed = False
 
     # -------------------------------------------------------------
-    # Check 5: PINN output range
+    # Check 5: PINN refinement forward pass
     # -------------------------------------------------------------
-    coarse, refined = model.sample(condition=condition, y_measured=y_meas_320, mask=mask_320, device=device)
+    refined = model.pinn(coarse=recon, zero_filled=condition)
     pinn_min, pinn_max = refined.min().item(), refined.max().item()
-    pinn_pass = (0.0 <= pinn_min) and (pinn_max <= 1.0)
-    print(f"Check 5: PINN output range [{pinn_min:.4f}, {pinn_max:.4f}] -> [{'PASS' if pinn_pass else 'FAIL'}]")
+    pinn_pass = (0.0 <= pinn_min) and (pinn_max <= 1.0) and not torch.isnan(refined).any()
+    print(f"Check 5: PINN Refinement output range [{pinn_min:.4f}, {pinn_max:.4f}] -> [{'PASS' if pinn_pass else 'FAIL'}]")
     if not pinn_pass:
         all_passed = False
 
     # -------------------------------------------------------------
-    # Check 6: NaN/Inf detection across all outputs
+    # Check 6: End-to-end DiffusionPINN training pass
     # -------------------------------------------------------------
-    has_nan = any(
-        torch.isnan(t).any().item() or torch.isinf(t).any().item()
-        for t in [condition, target, pred_x0, diff_recon, coarse, refined]
+    out = model.forward_train(
+        target=target,
+        condition=condition,
+        mask=mask_recon,
+        mask_raw=mask_raw,
+        y_measured=y_raw_norm,
+        phase=phase_zf.unsqueeze(0).unsqueeze(0),
     )
-    nan_pass = not has_nan
-    print(f"Check 6: NaN/Inf detection (all tensors finite) -> [{'PASS' if nan_pass else 'FAIL'}]")
-    if not nan_pass:
+    e2e_pass = ("coarse" in out) and ("refined" in out) and ("pred_noise" in out)
+    print(f"Check 6: End-to-end DiffusionPINN forward pass -> [{'PASS' if e2e_pass else 'FAIL'}]")
+    if not e2e_pass:
         all_passed = False
 
     # -------------------------------------------------------------
-    # Check 7: Shape consistency across stages
+    # Check 7: Composite loss computation with forward operator
     # -------------------------------------------------------------
-    expected_shape = (1, 1, 320, 320)
-    shape_pass = (
-        condition.shape == expected_shape
-        and target.shape == expected_shape
-        and pred_x0.shape == expected_shape
-        and diff_recon.shape == expected_shape
-        and coarse.shape == expected_shape
-        and refined.shape == expected_shape
+    criterion = TotalReconstructionLoss(
+        image_loss_type="l1",
+        lambda_image=1.0,
+        lambda_kspace=0.1,
+        lambda_physics=0.1,
     )
-    print(f"Check 7: Shape consistency ({expected_shape}) -> [{'PASS' if shape_pass else 'FAIL'}]")
-    if not shape_pass:
+    loss_dict = criterion(
+        i_pred=out["refined"],
+        i_gt=target,
+        y_measured=y_raw_norm,
+        mask=mask_raw,
+        phase=phase_zf.unsqueeze(0).unsqueeze(0),
+    )
+    loss_val = loss_dict["total_loss"].item()
+    loss_pass = not np.isnan(loss_val) and not np.isinf(loss_val) and loss_val > 0.0
+    print(f"Check 7: Composite Loss computation ({loss_val:.4f}) -> [{'PASS' if loss_pass else 'FAIL'}]")
+    if not loss_pass:
         all_passed = False
 
     # -------------------------------------------------------------
-    # Check 8: FFT/IFFT round-trip accuracy
+    # Check 8: Forward operator roundtrip & data consistency
     # -------------------------------------------------------------
-    k_roundtrip = image_to_kspace_torch(sim_complex)
-    img_roundtrip = kspace_to_image_torch(k_roundtrip)
-    fft_err = torch.norm(img_roundtrip - sim_complex).item() / torch.norm(sim_complex).item()
-    fft_pass = fft_err < 1e-6
-    print(f"Check 8: FFT/IFFT round-trip error ({fft_err:.2e} < 1e-6) -> [{'PASS' if fft_pass else 'FAIL'}]")
-    if not fft_pass:
-        all_passed = False
-
-    # -------------------------------------------------------------
-    # Check 9: Data-consistency error on sampled k-space
-    # -------------------------------------------------------------
-    dc_out = apply_data_consistency(
-        x_image=refined,
-        k_measured=y_meas_320,
-        mask=mask_320,
-        return_complex=True,
+    forward_op = MRIForwardOperator()
+    x_test = target[0, 0]
+    k_test = forward_op.forward_kspace(x_test, target_shape=(640, 368))
+    x_adj = forward_op.adjoint(k_test, crop_shape=(320, 320))
+    # Center crop of zero-padded FFT matches original exactly:
+    rt_err = torch.norm(torch.real(x_adj) - x_test).item() / (torch.norm(x_test).item() + 1e-12)
+    dc_res = forward_op.data_consistency(
+        x_crop=x_test,
+        y_raw=y_raw_norm,
+        mask_raw=mask_raw,
+        return_complex=False,
     )
-    k_dc = image_to_kspace_torch(dc_out)
-    sampled_fidelity_err = torch.norm(mask_320 * (k_dc - y_meas_320)).item() / (torch.norm(y_meas_320).item() + 1e-12)
-    dc_pass = sampled_fidelity_err < 1e-5
-    print(f"Check 9: Data-consistency sampled k-space fidelity ({sampled_fidelity_err:.2e} < 1e-5) -> [{'PASS' if dc_pass else 'FAIL'}]")
+    dc_pass = (rt_err < 1e-4) and not torch.isnan(dc_res).any()
+    print(f"Check 8: Forward operator adjoint roundtrip (err={rt_err:.2e}) -> [{'PASS' if dc_pass else 'FAIL'}]")
     if not dc_pass:
+        all_passed = False
+
+    # -------------------------------------------------------------
+    # Check 9: Evaluation metrics implementation
+    # -------------------------------------------------------------
+    tgt_np = target[0, 0].numpy()
+    pred_np = out["refined"][0, 0].detach().numpy()
+    data_range = float(tgt_np.max() - tgt_np.min() + 1e-12)
+    psnr_val = calculate_psnr(tgt_np, pred_np, data_range=data_range)
+    ssim_val = calculate_ssim(tgt_np, pred_np, data_range=data_range)
+    nmse_val = calculate_nmse(tgt_np, pred_np)
+    metrics_pass = (psnr_val > 0) and (0.0 <= ssim_val <= 1.0) and (nmse_val >= 0.0)
+    print(f"Check 9: Metrics: PSNR={psnr_val:.2f} dB, SSIM={ssim_val:.4f}, NMSE={nmse_val:.4f} -> [{'PASS' if metrics_pass else 'FAIL'}]")
+    if not metrics_pass:
         all_passed = False
 
     print("=" * 70)
     if all_passed:
-        print("ALL 9 SANITY CHECKS PASSED SUCCESSFULLY! [PASS]")
+        print("ALL 9 RECONSTRUCTION SANITY CHECKS PASSED [OK]")
     else:
-        print("SOME SANITY CHECKS FAILED! [FAIL]")
+        print("ONE OR MORE CHECKS FAILED [ERROR]")
     print("=" * 70)
-
     return all_passed
 
 

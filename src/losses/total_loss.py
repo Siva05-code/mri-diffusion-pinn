@@ -63,6 +63,7 @@ class TotalReconstructionLoss(nn.Module):
         y_measured: Optional[torch.Tensor] = None,
         k_gt: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        phase: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute total composite loss and component terms.
@@ -73,6 +74,7 @@ class TotalReconstructionLoss(nn.Module):
             y_measured: Undersampled acquired k-space measurements.
             k_gt: Full/reference k-space (if available, else y_measured is used).
             mask: Binary sampling mask.
+            phase: Optional spatial phase tensor.
 
         Returns:
             Dict containing:
@@ -89,7 +91,7 @@ class TotalReconstructionLoss(nn.Module):
         # 2. K-space loss (Fourier fidelity)
         ref_kspace = k_gt if k_gt is not None else y_measured
         if ref_kspace is not None and mask is not None:
-            kspace_loss = self.kspace_loss_fn(i_pred, ref_kspace, mask)
+            kspace_loss = self.kspace_loss_fn(i_pred, ref_kspace, mask, phase=phase)
         else:
             kspace_loss = torch.tensor(0.0, device=i_pred.device)
 

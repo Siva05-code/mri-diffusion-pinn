@@ -89,11 +89,16 @@ def main():
                 f"Real training requires official fastMRI files.\n"
                 f"For quick code verification, run with --smoke_test."
             )
-    else:
         if not train_dir or not Path(train_dir).exists():
             if val_dir and Path(val_dir).exists():
                 print(f"[SMOKE TEST] Using validation subset '{val_dir}' for pipeline verification.")
                 train_dir = val_dir
+            else:
+                print("[SMOKE TEST] FastMRI dataset directories not found locally.")
+                print("[SMOKE TEST] Using simulated fastMRI knee dataset.")
+                smoke_root = Path("data/fastmri/smoke")
+                train_dir = str(smoke_root / "train")
+                val_dir = str(smoke_root / "val")
 
     epochs = args.epochs or train_cfg.get("epochs", 5)
     learning_rate = args.lr or train_cfg.get("learning_rate", 1e-4)

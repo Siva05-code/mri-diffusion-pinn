@@ -1,23 +1,24 @@
 """
 Conditional Diffusion MRI Reconstruction Training Engine.
 
-Trains a conditional diffusion U-Net (DDPM) conditioned on zero-filled MRI inputs.
+Trains a conditional diffusion U-Net (DDPM) conditioned on zero-filled MRI inputs and sampling masks.
 Optimizes a joint objective:
     L_total = L_noise + lambda_image * L_image + lambda_kspace * L_kspace
 where:
     L_noise  = MSE(predicted_noise, noise)
     L_image  = L1(x0_pred, target)
-    L_kspace = relative Fourier error of x0_pred at sampled locations in 320x320 domain
+    L_kspace = relative Fourier error against ACTUAL acquired raw measurements y_raw:
+               || M_raw ⊙ (A(x0_pred; φ_zf) - y_raw) ||_1 / (|| M_raw ⊙ y_raw ||_1 + eps)
     x0_pred  = (x_t - sqrt(1 - alpha_bar) * predicted_noise) / sqrt(alpha_bar)  (Tweedie's formula)
 
 Validation uses the real multi-step reverse diffusion inference path (schedule.sample)
-without access to ground truth.
+with raw-domain measurement guidance and zero ground-truth leakage.
 """
 
 import json
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -25,29 +26,44 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from src.data.dataset import FastMRIDataset
-from src.data.preprocessing import align_and_normalize_slice, center_crop
-from src.data.undersampling import RandomMaskFunc
+from src.data.preprocessing import normalize_slice_pair, center_crop
+from src.data.undersampling import (
+    EquispacedMaskFunc,
+    RandomMaskFunc,
+    create_mask_func,
+    get_recon_conditioning_mask,
+)
 from src.evaluation.metrics import calculate_nmse, calculate_psnr, calculate_ssim
 from src.models.diffusion import ConditionalDiffusionUNet
 from src.models.diffusion_schedule import DiffusionSchedule
-from src.physics.fft import image_to_kspace_torch, kspace_to_image_torch
+from src.physics.forward_operator import MRIForwardOperator
+from src.physics.fft import kspace_to_image_torch
 
 
 def prepare_batch(
     sample: dict,
-    mask_func: RandomMaskFunc,
+    mask_func: Union[EquispacedMaskFunc, RandomMaskFunc],
     device: torch.device,
     acceleration: int,
     seed: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Prepare one MRI sample for diffusion training.
+    Prepare one MRI sample for diffusion training or validation.
+
+    Physical Process:
+        1. Acquisition: y_raw = mask_raw * kspace_full  (in raw [640, 368] domain)
+        2. Reconstruction: zf_complex = IFFT(y_raw)
+        3. FOV Cropping: zf_crop = center_crop(zf_complex, (320, 320))
+        4. Target Extraction: target_crop = center_crop(target, (320, 320))
+        5. Shared Normalization: scale = percentile(zf_mag, 99). Divide all by scale.
 
     Returns:
-        zf_out:          normalized 320x320 zero-filled magnitude image
-        tgt_out:         normalized 320x320 target magnitude image
-        mask_320:        320x320 reconstruction-domain sampling mask
-        k_measured_320:  complex 320x320 measured k-space
+        zf_out:      Normalized 320x320 zero-filled magnitude image [B, 1, 320, 320]
+        tgt_out:     Normalized 320x320 target magnitude image [B, 1, 320, 320]
+        mask_recon:  320x320 conditioning mask for model channel 3 [B, 1, 320, 320]
+        y_raw_norm:  Normalized raw complex measurements [B, H_raw, W_raw]
+        mask_raw:    Raw acquisition mask [B, H_raw, W_raw]
+        phase_zf:    Phase map from zero-filled reconstruction [B, 1, 320, 320]
     """
     kspace = sample["kspace"].to(device)
     raw_target = sample.get("target")
@@ -59,130 +75,79 @@ def prepare_batch(
         else:
             kspace = kspace.to(torch.complex64)
 
-    # ---------------------------------------------------------
-    # 1. Generate undersampling mask in the original acquisition
-    #    domain and create the actual measured k-space.
-    # ---------------------------------------------------------
-    mask = mask_func(kspace.shape, seed=seed).to(device)
-    undersampled = kspace * mask
+    # 1. Raw acquisition mask and measurement
+    mask_raw = mask_func(kspace.shape, seed=seed).to(device)
+    y_raw = kspace * mask_raw
 
-    # ---------------------------------------------------------
-    # 2. Zero-filled complex reconstruction
-    # ---------------------------------------------------------
-    zf_complex = kspace_to_image_torch(undersampled)
-    zf_mag = torch.abs(zf_complex)
+    # 2. Zero-filled complex reconstruction via centered 2D IFFT
+    zf_complex_raw = kspace_to_image_torch(y_raw)
+    zf_complex_crop = center_crop(zf_complex_raw, (320, 320))
+    zf_mag_crop = torch.abs(zf_complex_crop)
+    phase_zf = torch.angle(zf_complex_crop)
 
-    # ---------------------------------------------------------
-    # 3. Target reference
-    # ---------------------------------------------------------
+    # 3. Target reference image
     if raw_target is not None:
-        tgt_mag = raw_target.to(device)
-
-        if torch.is_complex(tgt_mag):
-            tgt_mag = torch.abs(tgt_mag)
+        tgt_tensor = raw_target.to(device)
+        if torch.is_complex(tgt_tensor):
+            tgt_tensor = torch.abs(tgt_tensor)
+        target_crop = center_crop(tgt_tensor, (320, 320))
     else:
         full_complex = kspace_to_image_torch(kspace)
-        tgt_mag = torch.abs(full_complex)
+        target_crop = center_crop(torch.abs(full_complex), (320, 320))
 
-    # ---------------------------------------------------------
-    # 4. Align and normalize image-domain data to 320x320
-    # ---------------------------------------------------------
-    if zf_mag.ndim == 2:
-        zf_norm, tgt_norm = align_and_normalize_slice(
-            zf_mag,
-            tgt_mag,
-        )
+    # 4. Shared per-slice normalization derived strictly from zero-filled condition
+    zf_norm, tgt_norm, scale = normalize_slice_pair(zf_mag_crop, target_crop, percentile=99.0)
+    y_raw_norm = y_raw / scale
 
+    # Guarantee 4D shape [B, 1, 320, 320]
+    if zf_norm.ndim == 2:
         zf_out = zf_norm.unsqueeze(0).unsqueeze(0).float()
         tgt_out = tgt_norm.unsqueeze(0).unsqueeze(0).float()
-
+        phase_out = phase_zf.unsqueeze(0).unsqueeze(0).float()
+    elif zf_norm.ndim == 3:
+        zf_out = zf_norm.unsqueeze(1).float()
+        tgt_out = tgt_norm.unsqueeze(1).float()
+        phase_out = phase_zf.unsqueeze(1).float()
     else:
-        zf_list, tgt_list = [], []
+        zf_out = zf_norm.float()
+        tgt_out = tgt_norm.float()
+        phase_out = phase_zf.float()
 
-        for b in range(zf_mag.shape[0]):
-            z_n, t_n = align_and_normalize_slice(
-                zf_mag[b],
-                tgt_mag[b],
-            )
+    # 5. Build conditioning mask aligned with reconstruction domain
+    mask_recon = get_recon_conditioning_mask(mask_raw, recon_size=(320, 320)).to(device)
 
-            zf_list.append(z_n)
-            tgt_list.append(t_n)
+    # Broadcast mask_raw to match y_raw shape if necessary
+    if mask_raw.shape != y_raw.shape:
+        mask_raw = mask_raw.expand_as(y_raw)
 
-        zf_out = torch.stack(zf_list, dim=0).unsqueeze(1).float()
-        tgt_out = torch.stack(tgt_list, dim=0).unsqueeze(1).float()
-
-    while zf_out.ndim > 4:
-        zf_out = zf_out.squeeze(1)
-
-    while tgt_out.ndim > 4:
-        tgt_out = tgt_out.squeeze(1)
-
-    # ---------------------------------------------------------
-    # 5. Create a physically consistent 320x320 measured
-    #    k-space representation.
-    #
-    #    IMPORTANT:
-    #    Keep the complex zero-filled image before taking
-    #    magnitude. Crop the complex image to the same FOV,
-    #    then FFT it.
-    # ---------------------------------------------------------
-    zf_complex_320 = center_crop(
-        zf_complex,
-        (tgt_out.shape[-2], tgt_out.shape[-1]),
-    )
-
-    k_measured_320 = image_to_kspace_torch(
-        zf_complex_320.to(torch.complex64)
-    )
-
-    # ---------------------------------------------------------
-    # 6. Build a 320x320 reconstruction-domain mask.
-    #
-    #    The mask is represented on the same grid as
-    #    k_measured_320 and k_tgt_320.
-    # ---------------------------------------------------------
-    mask_320 = center_crop(
-        mask,
-        (tgt_out.shape[-2], tgt_out.shape[-1]),
-    )
-
-    # Convert possible [1, 1, H, W] form to [H, W]
-    while mask_320.ndim > 2:
-        mask_320 = mask_320.squeeze(0)
-
-    mask_320 = mask_320.to(
-        device=k_measured_320.device,
-        dtype=k_measured_320.real.dtype,
-    )
-
-    return zf_out, tgt_out, mask_320, k_measured_320
+    return zf_out, tgt_out, mask_recon, y_raw_norm, mask_raw, phase_out
 
 
 def validate_diffusion_epoch(
     model: ConditionalDiffusionUNet,
     val_loader: DataLoader,
     schedule: DiffusionSchedule,
-    mask_func: RandomMaskFunc,
+    mask_func: Union[EquispacedMaskFunc, RandomMaskFunc],
     device: torch.device,
     acceleration: int,
-    max_val_batches: int = 10,
+    max_val_batches: Optional[int] = 10,
     seed: int = 42,
 ) -> Dict[str, float]:
     """
     Validates diffusion reconstruction on validation slices using the REAL inference path
-    (schedule.sample) without using ground truth target during reconstruction.
+    (schedule.sample) with raw-domain measurement guidance and without ground truth leakage.
     """
     model.eval()
     psnrs, ssims, nmses = [], [], []
-    zf_psnrs = []
+    zf_psnrs, zf_ssims, zf_nmses = [], [], []
 
     with torch.no_grad():
         for i, sample in enumerate(val_loader):
-            if i >= max_val_batches:
+            if max_val_batches is not None and i >= max_val_batches:
                 break
 
             slice_seed = seed + int(sample.get("slice_idx", [i])[0])
-            condition, target, mask_320, _ = prepare_batch(
+            zf_out, tgt_out, mask_recon, y_raw_norm, mask_raw, phase_zf = prepare_batch(
                 sample=sample,
                 mask_func=mask_func,
                 device=device,
@@ -193,25 +158,38 @@ def validate_diffusion_epoch(
             # Measurement-guided reverse diffusion inference from random Gaussian noise
             recon = schedule.sample(
                 model=model,
-                condition=condition,
-                mask=mask_320,
+                condition=zf_out,
+                mask=mask_recon,
+                y_raw=y_raw_norm,
+                mask_raw=mask_raw,
+                phase_zf=phase_zf,
+                measurement_guided=True,
                 device=device,
             )
 
             pred_np = recon[0, 0].clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
-            tgt_np = target[0, 0].cpu().numpy().astype(np.float32)
-            zf_np = condition[0, 0].cpu().numpy().astype(np.float32)
+            tgt_np = tgt_out[0, 0].cpu().numpy().astype(np.float32)
+            zf_np = zf_out[0, 0].cpu().numpy().astype(np.float32)
 
-            psnrs.append(calculate_psnr(tgt_np, pred_np))
-            ssims.append(calculate_ssim(tgt_np, pred_np))
+            data_range = float(tgt_np.max() - tgt_np.min() + 1e-12)
+            psnrs.append(calculate_psnr(tgt_np, pred_np, data_range=data_range))
+            ssims.append(calculate_ssim(tgt_np, pred_np, data_range=data_range))
             nmses.append(calculate_nmse(tgt_np, pred_np))
-            zf_psnrs.append(calculate_psnr(tgt_np, zf_np))
+
+            zf_psnrs.append(calculate_psnr(tgt_np, zf_np, data_range=data_range))
+            zf_ssims.append(calculate_ssim(tgt_np, zf_np, data_range=data_range))
+            zf_nmses.append(calculate_nmse(tgt_np, zf_np))
 
     return {
         "val_psnr": float(np.mean(psnrs)) if psnrs else 0.0,
+        "val_psnr_std": float(np.std(psnrs)) if psnrs else 0.0,
         "val_ssim": float(np.mean(ssims)) if ssims else 0.0,
+        "val_ssim_std": float(np.std(ssims)) if ssims else 0.0,
         "val_nmse": float(np.mean(nmses)) if nmses else 0.0,
+        "val_nmse_std": float(np.std(nmses)) if nmses else 0.0,
         "val_zf_psnr": float(np.mean(zf_psnrs)) if zf_psnrs else 0.0,
+        "val_zf_ssim": float(np.mean(zf_ssims)) if zf_ssims else 0.0,
+        "val_zf_nmse": float(np.mean(zf_nmses)) if zf_nmses else 0.0,
     }
 
 
@@ -219,6 +197,8 @@ def train_diffusion(
     train_dir: str,
     val_dir: str,
     acceleration: int = 4,
+    center_fraction: Optional[float] = None,
+    mask_type: str = "equispaced",
     epochs: int = 5,
     batch_size: int = 1,
     learning_rate: float = 1e-4,
@@ -227,7 +207,7 @@ def train_diffusion(
     lambda_image: float = 1.0,
     lambda_kspace: float = 0.1,
     seed: int = 42,
-    max_val_batches: int = 10,
+    max_val_batches: Optional[int] = 10,
     device: str = "cuda",
 ) -> Dict[str, any]:
     """
@@ -242,10 +222,15 @@ def train_diffusion(
         device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
     )
 
+    if center_fraction is None:
+        center_fraction = 0.08 if acceleration == 4 else 0.04
+
     print("=" * 65)
     print("CONDITIONAL DIFFUSION MRI RECONSTRUCTION TRAINING")
     print("=" * 65)
     print(f"Acceleration    : {acceleration}x")
+    print(f"Center Fraction : {center_fraction}")
+    print(f"Mask Protocol   : {mask_type.capitalize()} Cartesian")
     print(f"Epochs          : {epochs}")
     print(f"Batch Size      : {batch_size}")
     print(f"Learning Rate   : {learning_rate}")
@@ -275,12 +260,15 @@ def train_diffusion(
         num_workers=0,
     )
 
-    model = ConditionalDiffusionUNet(base_channels=32, time_dim=128).to(torch_device)
+    model = ConditionalDiffusionUNet(in_channels=3, base_channels=32, time_dim=128).to(torch_device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     schedule = DiffusionSchedule(timesteps=timesteps, device=torch_device)
-    mask_func = RandomMaskFunc(
-        center_fractions=[0.08 if acceleration == 4 else 0.04],
-        accelerations=[acceleration],
+    forward_op = MRIForwardOperator()
+
+    mask_func = create_mask_func(
+        mask_type=mask_type,
+        center_fraction=center_fraction,
+        acceleration=acceleration,
         seed=seed,
     )
 
@@ -302,7 +290,7 @@ def train_diffusion(
 
         for step, sample in enumerate(train_loader):
             batch_seed = seed + epoch * 10000 + step
-            condition, target, mask_320, k_tgt_320 = prepare_batch(
+            condition, target, mask_recon, y_raw_norm, mask_raw, phase_zf = prepare_batch(
                 sample=sample,
                 mask_func=mask_func,
                 device=torch_device,
@@ -317,8 +305,8 @@ def train_diffusion(
             # Add noise to ground-truth target
             noisy_target = schedule.add_noise(target, noise, t)
 
-            # Diffusion model predicts injected noise (receives noisy_target, condition, mask_320, t)
-            predicted_noise = model(noisy_target, condition, mask_320, t)
+            # Diffusion model predicts injected noise: [noisy_target, condition, mask_recon]
+            predicted_noise = model(noisy_target, condition, mask_recon, t)
 
             # 1. Noise prediction loss (DDPM objective)
             loss_noise = F.mse_loss(predicted_noise, noise)
@@ -329,12 +317,18 @@ def train_diffusion(
             # 3. Image reconstruction loss (L1)
             loss_image = F.l1_loss(x0_pred, target)
 
-            # 4. K-space fidelity loss in 320x320 Fourier domain
+            # 4. K-space fidelity loss using actual raw measurements
             if lambda_kspace > 0.0:
-                k_pred_320 = image_to_kspace_torch(x0_pred.squeeze(1).to(torch.complex64))
-                diff = mask_320 * (k_pred_320 - k_tgt_320)
+                raw_shape = (y_raw_norm.shape[-2], y_raw_norm.shape[-1])
+                k_pred_raw = forward_op.forward_kspace(
+                    x0_pred.squeeze(1),
+                    phase=phase_zf.squeeze(1),
+                    target_shape=raw_shape,
+                )
+                mask_k = mask_raw.to(device=k_pred_raw.device, dtype=k_pred_raw.real.dtype)
+                diff = mask_k * (k_pred_raw - y_raw_norm)
                 diff_mag = torch.sqrt(diff.real**2 + diff.imag**2 + 1e-12)
-                ref_mag = torch.sqrt((mask_320 * k_tgt_320).real**2 + (mask_320 * k_tgt_320).imag**2 + 1e-12)
+                ref_mag = torch.sqrt((mask_k * y_raw_norm).real**2 + (mask_k * y_raw_norm).imag**2 + 1e-12)
                 loss_kspace = torch.sum(diff_mag) / (torch.sum(ref_mag) + 1e-12)
             else:
                 loss_kspace = torch.tensor(0.0, device=torch_device)

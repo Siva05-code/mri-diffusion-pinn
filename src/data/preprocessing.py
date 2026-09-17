@@ -3,6 +3,9 @@ MRI Data Preprocessing Utilities.
 
 Provides functions to compute magnitude images, normalize k-space and reconstructed images,
 center crop images, and format complex numbers for PyTorch processing.
+
+Implements a unified, leakage-free per-slice normalization protocol using a single shared scale factor
+derived from the observed zero-filled reconstruction.
 """
 
 from typing import Tuple, Union, Optional
@@ -23,18 +26,61 @@ def complex_abs(data: torch.Tensor) -> torch.Tensor:
         return torch.abs(data)
 
 
-def normalize_zero_one(data: Union[np.ndarray, torch.Tensor], eps: float = 1e-12):
-    """Normalize array/tensor to [0, 1] range."""
-    d_min = data.min()
-    d_max = data.max()
-    return (data - d_min) / (d_max - d_min + eps)
+def compute_slice_scale(
+    image: torch.Tensor,
+    percentile: float = 99.0,
+    eps: float = 1e-11,
+) -> float:
+    """
+    Compute a robust intensity scaling factor for a slice based on a high intensity quantile.
+
+    Args:
+        image: Real or complex tensor.
+        percentile: Quantile percentile (default: 99.0).
+        eps: Small epsilon to prevent zero division.
+
+    Returns:
+        float: Positive scalar scale factor.
+    """
+    if torch.is_complex(image):
+        mag = torch.abs(image)
+    else:
+        mag = image.abs()
+
+    q = percentile / 100.0
+    scale = torch.quantile(mag.float().flatten(), q).item()
+    if scale < eps:
+        scale = mag.float().max().item()
+    return max(float(scale), eps)
 
 
-def normalize_instance(data: torch.Tensor, eps: float = 1e-11):
-    """Normalize data by subtracting mean and dividing by standard deviation."""
-    mean = data.mean()
-    std = data.std()
-    return (data - mean) / (std + eps), mean, std
+def normalize_slice_pair(
+    zf_image: torch.Tensor,
+    target_image: Optional[torch.Tensor] = None,
+    percentile: float = 99.0,
+    eps: float = 1e-11,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], float]:
+    """
+    Normalize zero-filled input and optional reference target using ONE shared scale factor.
+
+    To strictly guarantee ZERO ground-truth leakage at inference time, the reference scale
+    is calculated solely from the zero-filled input condition (or its 99th percentile).
+    Both the zero-filled condition and the ground-truth target are divided by this IDENTICAL scale,
+    preserving relative image contrast and physical intensity linearity for quantitative metrics (PSNR/SSIM).
+
+    Args:
+        zf_image: Zero-filled magnitude image tensor.
+        target_image: Optional target magnitude image tensor.
+        percentile: Quantile percentile for scale computation (default: 99.0).
+        eps: Numerical stability constant.
+
+    Returns:
+        Tuple: (zf_norm, target_norm, scale)
+    """
+    scale = compute_slice_scale(zf_image, percentile=percentile, eps=eps)
+    zf_norm = zf_image / scale
+    target_norm = (target_image / scale) if target_image is not None else None
+    return zf_norm, target_norm, scale
 
 
 def center_crop(data: torch.Tensor, target_shape: Tuple[int, int]) -> torch.Tensor:
@@ -59,7 +105,6 @@ def center_crop(data: torch.Tensor, target_shape: Tuple[int, int]) -> torch.Tens
         return data
 
     if curr_h < target_h or curr_w < target_w:
-        # If input is smaller than requested target, preserve native dimensions
         return data
 
     h_from = (curr_h - target_h) // 2
@@ -73,41 +118,24 @@ def align_and_normalize_slice(
     crop_size: Optional[Tuple[int, int]] = (320, 320),
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """
-    Ensures zero-filled input and reference target undergo consistent spatial preprocessing:
-    1. If target_image is provided:
-       - If target is pre-cropped (e.g., fastMRI reconstruction_rss at 320x320), center-crop zf_image to match.
-       - If both are raw IFFT (640x368) and crop_size is given, center-crop both to crop_size.
-       - Guarantees identical (320, 320) spatial dimensions without bilinear/bicubic distortion.
-       - Normalizes both inputs to [0, 1] consistently and returns (zf_norm, target_norm).
-    2. If target_image is None:
-       - Center-crops zf_image to crop_size (if specified) and normalizes to [0, 1].
-       - Returns zf_norm.
-
-    Args:
-        zf_image: Zero-filled magnitude image tensor [H_zf, W_zf]
-        target_image: Optional reference target magnitude image tensor [H_tgt, W_tgt]
-        crop_size: Standard evaluation FOV (default: (320, 320))
-
-    Returns:
-        Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-            (zf_norm, target_norm) if target_image is provided, else zf_norm.
+    Spatial alignment and unified shared-scale normalization.
+    Ensures zero-filled and target slices are on the identical intensity scale and FOV.
     """
     if target_image is None:
         if crop_size is not None and zf_image.shape[-2:] != crop_size:
             if zf_image.shape[-2] >= crop_size[0] and zf_image.shape[-1] >= crop_size[1]:
                 zf_image = center_crop(zf_image, crop_size)
-        return normalize_zero_one(zf_image)
+        zf_norm, _, _ = normalize_slice_pair(zf_image, target_image=None)
+        return zf_norm
 
-    # Both images provided:
-    # Case 1: Target is already pre-cropped (e.g., fastMRI reconstruction_rss at 320x320)
-    if zf_image.shape != target_image.shape:
+    # Spatially align dimensions to crop_size
+    if zf_image.shape[-2:] != target_image.shape[-2:]:
         target_shape = (target_image.shape[-2], target_image.shape[-1])
         if zf_image.shape[-2] >= target_shape[0] and zf_image.shape[-1] >= target_shape[1]:
             zf_image = center_crop(zf_image, target_shape)
         elif target_image.shape[-2] >= zf_image.shape[-2] and target_image.shape[-1] >= zf_image.shape[-1]:
             target_image = center_crop(target_image, (zf_image.shape[-2], zf_image.shape[-1]))
 
-    # Case 2: Both are still full k-space IFFT (640x368); crop both to standard FOV if requested
     if crop_size is not None and zf_image.shape[-2:] != crop_size:
         if zf_image.shape[-2] >= crop_size[0] and zf_image.shape[-1] >= crop_size[1]:
             zf_image = center_crop(zf_image, crop_size)
@@ -117,6 +145,5 @@ def align_and_normalize_slice(
         f"Spatial dimension mismatch after alignment: zf {zf_image.shape} vs target {target_image.shape}"
     )
 
-    zf_norm = normalize_zero_one(zf_image)
-    target_norm = normalize_zero_one(target_image)
+    zf_norm, target_norm, _ = normalize_slice_pair(zf_image, target_image)
     return zf_norm, target_norm

@@ -3,24 +3,25 @@ K-Space Domain Data-Consistency Loss for Accelerated MRI.
 
 Measures the discrepancy between reference k-space measurements and
 the forward Fourier transform of the reconstructed image at sampled trajectory points:
-    L_kspace = || M ⊙ (FFT(I_pred) - K_gt) ||_1 / (|| M ⊙ K_gt ||_1 + eps)
+    L_kspace = || M ⊙ (A(I_pred; φ) - y_meas) ||_1 / (|| M ⊙ y_meas ||_1 + eps)
 
-Correctly handles complex k-space using complex modulus:
+Correctly handles complex k-space using differentiable complex modulus:
     |z| = sqrt(Re(z)^2 + Im(z)^2 + eps)
 """
 
 from typing import Optional
 import torch
 import torch.nn as nn
+from src.physics.forward_operator import MRIForwardOperator
 from src.physics.fft import image_to_kspace_torch
 
 
 class KSpaceDataConsistencyLoss(nn.Module):
     """
-    K-Space Loss comparing predicted k-space against reference k-space at sampled locations.
+    K-Space Loss comparing forward model of predicted reconstruction against reference k-space at sampled locations.
 
     Args:
-        norm (str): 'l1' or 'l2' norm.
+        norm (str): 'l1' or 'l2' norm (default: 'l1').
         relative (bool): Whether to normalize by the norm of reference k-space at sampled locations (default: True).
         eps (float): Numerical stability epsilon.
     """
@@ -29,35 +30,34 @@ class KSpaceDataConsistencyLoss(nn.Module):
         self.norm = norm.lower()
         self.relative = relative
         self.eps = eps
+        self.forward_op = MRIForwardOperator()
 
     def forward(
         self,
         i_pred: torch.Tensor,
         k_gt: torch.Tensor,
         mask: torch.Tensor,
+        phase: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute k-space loss at sampled locations:
-            L_kspace = || M * (FFT(I_pred) - K_gt) ||_1
+            L_kspace = || M * (A(I_pred) - K_meas) ||_1
 
         Args:
             i_pred: Predicted image [B, 1, H, W], [B, H, W], or [H, W].
-            k_gt: Reference k-space (complex tensor).
+            k_gt: Measured/reference k-space (complex tensor).
             mask: Binary sampling mask (1 for measured lines, 0 unmeasured).
+            phase: Optional spatial phase tensor.
 
         Returns:
             torch.Tensor: Differentiable scalar k-space loss.
         """
-        # Ensure i_pred is complex [..., H, W]
         if i_pred.ndim == 4 and i_pred.shape[1] == 1:
             img = i_pred.squeeze(1)
+            phase_in = phase.squeeze(1) if (phase is not None and phase.ndim == 4 and phase.shape[1] == 1) else phase
         else:
             img = i_pred
-
-        if not torch.is_complex(img):
-            img_complex = img.to(torch.complex64)
-        else:
-            img_complex = img
+            phase_in = phase
 
         if not torch.is_complex(k_gt):
             if k_gt.shape[-1] == 2:
@@ -65,21 +65,21 @@ class KSpaceDataConsistencyLoss(nn.Module):
             else:
                 k_gt = k_gt.to(torch.complex64)
 
-        img_h, img_w = img_complex.shape[-2], img_complex.shape[-1]
+        img_h, img_w = img.shape[-2], img.shape[-1]
         k_h, k_w = k_gt.shape[-2], k_gt.shape[-1]
 
-        # Handle size matching between image and k-space
+        # Handle size matching between image and k-space via forward operator
         if (img_h, img_w) == (k_h, k_w):
-            k_pred = image_to_kspace_torch(img_complex)
+            if not torch.is_complex(img):
+                if phase_in is not None:
+                    img_c = img.to(torch.complex64) * torch.exp(1j * phase_in.to(img.device))
+                else:
+                    img_c = img.to(torch.complex64)
+            else:
+                img_c = img
+            k_pred = image_to_kspace_torch(img_c)
         else:
-            pad_top = (k_h - img_h) // 2
-            pad_bottom = k_h - img_h - pad_top
-            pad_left = (k_w - img_w) // 2
-            pad_right = k_w - img_w - pad_left
-            img_padded = torch.nn.functional.pad(
-                img_complex, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0
-            )
-            k_pred = image_to_kspace_torch(img_padded)
+            k_pred = self.forward_op.forward_kspace(img, phase=phase_in, target_shape=(k_h, k_w))
 
         mask = mask.to(k_pred.device, dtype=k_pred.real.dtype)
 
