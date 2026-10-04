@@ -1,0 +1,9 @@
+torch>=2.1
+numpy>=1.24
+h5py>=3.9
+PyYAML>=6.0
+tqdm>=4.65
+matplotlib>=3.7
+pytest>=7.4
+# scikit-image is optional. SSIM is implemented in torch in
+# src/evaluation/metrics.py and is validated against skimage to ~3e-5.

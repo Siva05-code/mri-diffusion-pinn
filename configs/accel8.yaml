@@ -1,0 +1,66 @@
+# Stage 3 of the training plan: 8x acceleration.
+seed: 42
+image_size: 320
+
+# Undersampling
+accelerations: [8]          # list -> one is drawn at random per sample
+val_accelerations: [8]
+center_fraction: 0.04
+mask_mode: random           # random | equispaced
+slice_range: [0.15, 0.95]   # drop the noisy outer slices of each volume
+
+# Model
+base_channels: 48
+channel_mult: [1, 2, 4, 8]
+num_res_blocks: 2
+attention_levels: [2, 3]    # attention at 80x80 and 40x40 only
+time_dim: 256
+dropout: 0.0
+
+# Diffusion
+diffusion_steps: 1000
+beta_schedule: cosine       # cosine | linear
+prediction_type: v          # v | eps   (v is far more stable here)
+inference_steps: 50
+eta: 0.0                    # 0 = deterministic DDIM
+residual_scale: 0           # 0 = estimate automatically from the data
+
+# Optimisation
+batch_size: 4
+val_batch_size: 4
+num_workers: 2
+epochs: 30
+learning_rate: 0.0002
+weight_decay: 0.00001
+grad_clip: 1.0
+gradient_accumulation: 2
+warmup_pct: 0.05
+ema_decay: 0.999
+amp: true
+
+# Loss weights
+lambda_image: 1.0
+lambda_kspace: 0.1
+lambda_gradient: 0.01
+
+# Ablation switch
+use_mask_conditioning: true
+
+# Data limits (0 = use everything)
+max_train_files: 0
+max_val_files: 0
+max_train_slices: 0
+max_val_slices: 0
+val_max_batches: 16
+
+# Optional pre-built caches from scripts/prepare_data.py
+train_cache: null
+val_cache: null
+
+# --- quality levers (v2) ---
+min_snr_gamma: 5.0          # min-SNR-gamma loss rebalancing; 0 disables
+lambda_ssim: 0.1            # put SSIM in the objective, not just the report
+t_start_frac: 0.6           # where to start the reverse chain; lower = higher PSNR
+val_num_samples: 1          # samples averaged during validation (keep 1, it is slow)
+eval_num_samples: 4         # samples averaged at final evaluation
+eval_tta: false             # flip ensembling at evaluation; costs 4x
